@@ -152,6 +152,46 @@ final class JITEnableContext {
     private var handshake: OpaquePointer?
 
     private let tunnelLock = NSLock()
+    private var locationLeaseCount = 0
+    private var retiredLocationTunnels: [TunnelHandles] = []
+
+    final class ExistingTunnelLease {
+        let adapter: OpaquePointer
+        let handshake: OpaquePointer
+        private let onRelease: () -> Void
+
+        init(adapter: OpaquePointer, handshake: OpaquePointer, onRelease: @escaping () -> Void) {
+            self.adapter = adapter
+            self.handshake = handshake
+            self.onRelease = onRelease
+        }
+
+        deinit { onRelease() }
+    }
+
+    // A location session can use the tunnel established on Wi-Fi without
+    // starting a second pairing connection after switching to cellular.
+    // Leases retain retired handles if another operation replaces the tunnel.
+    func acquireExistingLocationTunnel() -> ExistingTunnelLease? {
+        tunnelLock.lock()
+        defer { tunnelLock.unlock() }
+        guard let adapter, let handshake else { return nil }
+        locationLeaseCount += 1
+        return ExistingTunnelLease(adapter: adapter, handshake: handshake) { [weak self] in
+            self?.releaseLocationTunnel()
+        }
+    }
+
+    private func releaseLocationTunnel() {
+        tunnelLock.lock()
+        defer { tunnelLock.unlock() }
+        locationLeaseCount = max(0, locationLeaseCount - 1)
+        if locationLeaseCount == 0 {
+            for var tunnel in retiredLocationTunnels { tunnel.free() }
+            retiredLocationTunnels.removeAll()
+        }
+    }
+
     private var tunnelConnecting = false
     private var tunnelSemaphore: DispatchSemaphore?
     private var lastTunnelError: NSError?
@@ -340,11 +380,13 @@ final class JITEnableContext {
             throw tunnelError
         }
 
-        if let handshake {
-            rsd_handshake_free(handshake)
-        }
-        if let adapter {
-            adapter_free(adapter)
+        tunnelLock.lock()
+        defer { tunnelLock.unlock() }
+        if locationLeaseCount > 0 {
+            retiredLocationTunnels.append(TunnelHandles(adapter: adapter, handshake: handshake))
+        } else {
+            if let handshake { rsd_handshake_free(handshake) }
+            if let adapter { adapter_free(adapter) }
         }
 
         adapter = newAdapter

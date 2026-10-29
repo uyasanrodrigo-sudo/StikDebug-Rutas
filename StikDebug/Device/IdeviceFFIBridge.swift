@@ -755,7 +755,45 @@ private enum LocationSimulationStatus {
     static let locationClear: Int32 = 12
 }
 
+private enum LocationSimulationFailure {
+    static let lock = NSLock()
+    static var lastCode: Int32 = 0
+    static var lastDetail = ""
+
+    static func record(code: Int32, error: UnsafeMutablePointer<IdeviceFfiError>?, fallback: String) {
+        let detail = IdeviceBridge.consumeFFIError(error, fallback: fallback).localizedDescription
+        lock.lock()
+        lastCode = code
+        lastDetail = detail
+        lock.unlock()
+        NSLog("[StikDebug] Location simulation failed at stage %d: %@", code, detail)
+    }
+
+    static func detail(for code: Int32) -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        return lastCode == code ? lastDetail : ""
+    }
+}
+
+func locationSimulationErrorMessage(for code: Int32) -> String {
+    let explanation: String
+    switch code {
+    case 1:
+        explanation = "The target device IP address is invalid. Check the connection settings."
+    case 2:
+        explanation = "The pairing file could not be read. Import a valid pairing file for this iPhone."
+    case 3:
+        explanation = "The local VPN tunnel could not be created. This happens before accessing the location service; it does not establish that the DDI is missing. Check LocalDevVPN. On cellular-only connections, prepare the session on Wi-Fi first; some iOS versions require briefly toggling Airplane Mode with the VPN enabled."
+    default:
+        explanation = "The developer location service could not complete the request. Check the VPN connection and prepare the DDI on Wi-Fi after restarting the iPhone."
+    }
+    let detail = LocationSimulationFailure.detail(for: code)
+    return "Location simulation error \(code). \(explanation)" + (detail.isEmpty ? "" : "\n\nDetails: \(detail)")
+}
+
 private enum LocationSimulationState {
+    static var sharedTunnelLease: JITEnableContext.ExistingTunnelLease?
     static var adapter: OpaquePointer?
     static var handshake: OpaquePointer?
     static var remoteServer: OpaquePointer?
@@ -778,6 +816,7 @@ private enum LocationSimulationState {
             adapter_free(adapter)
             self.adapter = nil
         }
+        sharedTunnelLease = nil
     }
 }
 
@@ -795,9 +834,20 @@ func simulate_location(_ deviceIP: String, _ latitude: Double, _ longitude: Doub
         }
     }
 
+    if let lease = JITEnableContext.shared.acquireExistingLocationTunnel() {
+        LocationSimulationState.sharedTunnelLease = lease
+        let result = startLocationSimulationService(
+            adapter: lease.adapter, handshake: lease.handshake,
+            latitude: latitude, longitude: longitude
+        )
+        if result == LocationSimulationStatus.ok { return result }
+        LocationSimulationState.cleanup()
+    }
+
     var address = sockaddr_in()
     address.sin_family = sa_family_t(AF_INET)
-    address.sin_port = in_port_t(RemotePairingPortResolver.resolve()).bigEndian
+    let pairingPort = RemotePairingPortResolver.resolve()
+    address.sin_port = in_port_t(pairingPort).bigEndian
 
     let inetResult = deviceIP.withCString { inet_pton(AF_INET, $0, &address.sin_addr) }
     guard inetResult == 1 else {
@@ -833,18 +883,33 @@ func simulate_location(_ deviceIP: String, _ latitude: Double, _ longitude: Doub
     }
 
     if let providerError {
-        idevice_error_free(providerError)
+        LocationSimulationFailure.record(
+            code: LocationSimulationStatus.providerCreate,
+            error: providerError,
+            fallback: "Could not create local tunnel at \(deviceIP):\(pairingPort)"
+        )
         LocationSimulationState.cleanup()
         return LocationSimulationStatus.providerCreate
     }
 
+    return startLocationSimulationService(
+        adapter: LocationSimulationState.adapter,
+        handshake: LocationSimulationState.handshake,
+        latitude: latitude, longitude: longitude
+    )
+}
+
+private func startLocationSimulationService(
+    adapter: OpaquePointer?, handshake: OpaquePointer?,
+    latitude: Double, longitude: Double
+) -> Int32 {
     let remoteServerError = remote_server_connect_rsd(
-        LocationSimulationState.adapter,
-        LocationSimulationState.handshake,
+        adapter,
+        handshake,
         &LocationSimulationState.remoteServer
     )
     if let remoteServerError {
-        idevice_error_free(remoteServerError)
+        LocationSimulationFailure.record(code: LocationSimulationStatus.remoteServer, error: remoteServerError, fallback: "Could not open developer remote server")
         LocationSimulationState.cleanup()
         return LocationSimulationStatus.remoteServer
     }
@@ -854,7 +919,7 @@ func simulate_location(_ deviceIP: String, _ latitude: Double, _ longitude: Doub
         &LocationSimulationState.locationSimulation
     )
     if let locationSimulationError {
-        idevice_error_free(locationSimulationError)
+        LocationSimulationFailure.record(code: LocationSimulationStatus.locationSimulation, error: locationSimulationError, fallback: "Could not open developer location simulation service")
         LocationSimulationState.cleanup()
         return LocationSimulationStatus.locationSimulation
     }
@@ -867,7 +932,7 @@ func simulate_location(_ deviceIP: String, _ latitude: Double, _ longitude: Doub
         longitude
     )
     if let locationSetError {
-        idevice_error_free(locationSetError)
+        LocationSimulationFailure.record(code: LocationSimulationStatus.locationSet, error: locationSetError, fallback: "Could not send simulated location")
         LocationSimulationState.cleanup()
         return LocationSimulationStatus.locationSet
     }
