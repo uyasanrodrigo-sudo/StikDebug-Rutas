@@ -246,7 +246,7 @@ struct MainTabView: View {
                 } else {
                     showAlert(
                         title: "Location Simulation Failed",
-                        message: "Could not simulate location from URL (error \(code)). Make sure the device is connected and the DDI is mounted.",
+                        message: locationSimulationErrorMessage(for: code),
                         showOk: true
                     )
                 }
