@@ -31,3 +31,20 @@ enum RoutePlaybackTiming {
         return delays.indices.dropFirst().map { Step(sampleIndex: $0, delay: delays[$0]) }
     }
 }
+
+enum RouteTrafficBehavior {
+    // MKRoute's time is ideal; calculateETA includes expected traffic. Apply
+    // only a slowdown, never an acceleration above the user's chosen speed.
+    static func slowdown(idealTime: Double, trafficTime: Double) -> Double {
+        guard idealTime.isFinite, trafficTime.isFinite,
+              idealTime > 0, trafficTime > 0 else { return 1 }
+        return max(1, trafficTime / idealTime)
+    }
+
+    static func signalStopDuration(chanceRoll: Double, durationRoll: Double, maximum: Double) -> Double {
+        guard chanceRoll.isFinite, durationRoll.isFinite, maximum.isFinite,
+              chanceRoll >= 0, chanceRoll < 0.6 else { return 0 }
+        let upper = min(90, max(5, maximum))
+        return 5 + min(1, max(0, durationRoll)) * (upper - 5)
+    }
+}
