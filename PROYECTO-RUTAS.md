@@ -3,6 +3,8 @@
 Copia local de StikDebug 3.1.15, commit base `3422fc4725cd9d1fbc255ea36c6fe06eecfdf459`.
 Rama local: `route-speed-repeat`. Conserva la licencia AGPL-3.0 del proyecto original.
 
+El fork remoto parte de main `17b1e1d90d602a228de663a10efa987a9f9e547b`; la vista del simulador coincide con 3.1.15. Se incorporó el descubrimiento de puerto de ese main a la copia local.
+
 ## Cambios
 
 - Modo a pie o en carro: solicita las indicaciones correspondientes a Apple Maps.
@@ -14,6 +16,10 @@ Rama local: `route-speed-repeat`. Conserva la licencia AGPL-3.0 del proyecto ori
 - Las rutas importadas mantienen sus coordenadas, sin recalcularlas al cambiar el modo.
 - Caminar y velocidad personalizada omiten la consulta de velocidades de OpenStreetMap. La consulta en modo carro tiene un tiempo de espera de 20 segundos y usa una estimación si falla.
 - Las opciones de movimiento se cambian antes de iniciar; para modificarlas durante una simulación, detener primero.
+- En carro, paradas simuladas cerca de semáforos registrados en OpenStreetMap: 60% de probabilidad por paso y de 5 a 45 segundos por defecto, máximo configurable hasta 90 segundos. No se conoce el color real; los cruces con varios nodos próximos se agrupan.
+- Tráfico: compara calculateETA (con tráfico previsto) con el tiempo ideal de la ruta. Aplica una reducción aproximada para el recorrido completo, consultada al inicio de cada tramo de ida o vuelta. No inventa velocidades por calle; si la distancia estimada difiere más del 5%, la ruta es importada/alternativa, o la consulta falla, conserva la velocidad seleccionada. Cada consulta tiene un límite de espera de 15 segundos.
+- Conexión: intenta reutilizar el túnel que la app ya estableció, mantiene vivos sus identificadores durante la sesión y usa descubrimiento de puerto en la conexión nueva. El error 3 identifica creación del túnel; ahora muestra el detalle real en lugar de atribuirlo genéricamente al DDI.
+- El funcionamiento con datos móviles sigue pendiente de probar en esta versión modificada. No se garantiza que iOS permita abrir un túnel nuevo sin Wi-Fi.
 
 ## Estado de validación
 
@@ -35,7 +41,7 @@ swiftc StikDebug/Services/RoutePlaybackOptions.swift RoutePlaybackTimingChecks.s
 
 Para compilar sin tener una Mac propia, subir esta copia a un repositorio propio de GitHub y ejecutar manualmente el workflow **Build custom routes IPA**. Se incluye en `.github/workflows/custom_routes.yml`.
 Ese workflow ejecuta los tests anteriores, compila la app y adjunta `StikDebug-CustomRoutes.ipa` como artefacto. No publica releases ni envía cambios al repositorio original.
-No se ha subido esta copia a GitHub ni ejecutado un workflow remoto.
+Repositorio remoto: https://github.com/uyasanrodrigo-sudo/StikDebug-Rutas/tree/route-speed-repeat . La primera compilación (sin tráfico ni reutilización del túnel) terminó correctamente y pasó las pruebas de velocidad y ciclos: https://github.com/uyasanrodrigo-sudo/StikDebug-Rutas/actions/runs/40887135833 . Las mejoras posteriores requieren una nueva compilación y prueba física.
 El artefacto requiere firma mediante iLoader/SideStore antes de usarlo en el iPhone.
 
 ## Comprobaciones pendientes en iPhone

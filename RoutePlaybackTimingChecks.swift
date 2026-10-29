@@ -34,6 +34,17 @@ struct RoutePlaybackTimingChecks {
         let shortReturn = RoutePlaybackTiming.steps(delays: [0, 0.4], returning: true)
         precondition(shortReturn.count == 1 && shortReturn[0].sampleIndex == 0)
         near(shortReturn[0].delay, 0.4)
+        near(RouteTrafficBehavior.slowdown(idealTime: 100, trafficTime: 150), 1.5)
+        near(RouteTrafficBehavior.slowdown(idealTime: 100, trafficTime: 80), 1)
+        near(RouteTrafficBehavior.slowdown(idealTime: 0, trafficTime: 80), 1)
+        near(RouteTrafficBehavior.slowdown(idealTime: .nan, trafficTime: 80), 1)
+        near(RouteTrafficBehavior.slowdown(idealTime: 100, trafficTime: .infinity), 1)
+        near(RouteTrafficBehavior.signalStopDuration(chanceRoll: 0.9, durationRoll: 0.5, maximum: 45), 0)
+        near(RouteTrafficBehavior.signalStopDuration(chanceRoll: 0.6, durationRoll: 0.5, maximum: 45), 0)
+        near(RouteTrafficBehavior.signalStopDuration(chanceRoll: 0.2, durationRoll: 0, maximum: 45), 5)
+        near(RouteTrafficBehavior.signalStopDuration(chanceRoll: 0.2, durationRoll: 1, maximum: 45), 45)
+        near(RouteTrafficBehavior.signalStopDuration(chanceRoll: 0.2, durationRoll: 0.5, maximum: 45), 25)
+        near(RouteTrafficBehavior.signalStopDuration(chanceRoll: 0.2, durationRoll: 1, maximum: 500), 90)
         print("Route timing checks passed")
     }
 }
