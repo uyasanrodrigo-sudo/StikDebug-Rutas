@@ -214,6 +214,8 @@ struct MainTabView: View {
             return
         }
 
+        LocationSimulationSession.shared.pauseResending()
+        LocationSimulationSession.shared.clearRoute()
         LocationSimulationCommandQueue.shared.async {
             let code = simulate_location(
                 DeviceConnectionContext.targetIPAddress,
@@ -231,14 +233,12 @@ struct MainTabView: View {
                             longitude: coordinate.longitude
                         )
                     ) {
-                        LocationSimulationCommandQueue.shared.async {
-                            _ = simulate_location(
-                                DeviceConnectionContext.targetIPAddress,
-                                coordinate.latitude,
-                                coordinate.longitude,
-                                pairingFile.path
-                            )
-                        }
+                        _ = simulate_location(
+                            DeviceConnectionContext.targetIPAddress,
+                            coordinate.latitude,
+                            coordinate.longitude,
+                            pairingFile.path
+                        )
                     }
                     LogManager.shared.addInfoLog(
                         String(format: "Simulated location from URL: %.6f, %.6f", coordinate.latitude, coordinate.longitude)
@@ -255,6 +255,8 @@ struct MainTabView: View {
     }
 
     private func clearSimulatedLocation() {
+        LocationSimulationSession.shared.pauseResending()
+        LocationSimulationSession.shared.clearRoute()
         LocationSimulationCommandQueue.shared.async {
             let code = clear_simulated_location()
             DispatchQueue.main.async {
