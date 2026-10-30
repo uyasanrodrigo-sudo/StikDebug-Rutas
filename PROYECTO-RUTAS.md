@@ -10,7 +10,7 @@ El fork remoto parte de main `17b1e1d90d602a228de663a10efa987a9f9e547b`; la vist
 - Modo a pie o en carro: solicita las indicaciones correspondientes a Apple Maps.
 - Velocidad automática: 5 km/h a pie; límites de carretera o estimación de Apple Maps en carro.
 - Velocidad personalizada de 0,5 a 200 km/h, con accesos a 5, 15 y 50 km/h.
-- Repetición continua de ida y vuelta por la misma geometría, sin saltar del destino al origen. Se detiene con Stop.
+- Repetición continua: en carro calcula un regreso independiente con Apple Maps; a pie y en rutas importadas recorre la geometría en sentido inverso. Se detiene con Stop.
 - Selección de rutas alternativas cuando Apple Maps las devuelve.
 - Recalcular solicita nuevas indicaciones; vista de mapa estándar o satélite.
 - Las rutas importadas mantienen sus coordenadas, sin recalcularlas al cambiar el modo.
@@ -19,15 +19,23 @@ El fork remoto parte de main `17b1e1d90d602a228de663a10efa987a9f9e547b`; la vist
 - En carro, paradas simuladas cerca de semáforos registrados en OpenStreetMap: 60% de probabilidad por paso y de 5 a 45 segundos por defecto, máximo configurable hasta 90 segundos. No se conoce el color real; los cruces con varios nodos próximos se agrupan.
 - Tráfico: compara calculateETA (con tráfico previsto) con el tiempo ideal de la ruta. Aplica una reducción aproximada para el recorrido completo, consultada al inicio de cada tramo de ida o vuelta. No inventa velocidades por calle; si la distancia estimada difiere más del 5%, la ruta es importada/alternativa, o la consulta falla, conserva la velocidad seleccionada. Cada consulta tiene un límite de espera de 15 segundos.
 - Conexión: intenta reutilizar el túnel que la app ya estableció, mantiene vivos sus identificadores durante la sesión y usa descubrimiento de puerto en la conexión nueva. El error 3 identifica creación del túnel; ahora muestra el detalle real en lugar de atribuirlo genéricamente al DDI.
-- El funcionamiento con datos móviles sigue pendiente de probar en esta versión modificada. No se garantiza que iOS permita abrir un túnel nuevo sin Wi-Fi.
+- El usuario confirmó una sesión funcional con datos móviles tras conectar LocalDevVPN, apagar temporalmente solo los datos, establecer la sesión y volver a activarlos. La guía aparece en opciones; no garantiza reconexión tras reinicio o cierre de la app.
 
 ## Estado de validación
 
-En Windows se revisaron la sintaxis Swift con tree-sitter y el formato del workflow YAML.
-No hay Xcode ni compilador Swift instalado: **no se ha compilado esta app, ejecutado los tests Swift ni instalado la versión modificada en el iPhone**.
-El archivo `.ipa` oficial que se instaló previamente no incluye estos cambios.
+La compilación anterior 472e6f7 pasó pruebas Swift y Xcode en GitHub Actions:
+https://github.com/uyasanrodrigo-sudo/StikDebug-Rutas/actions/runs/40890999015 .
+Se instaló con iLoader el 30 de octubre de 2026. Primero falló abrir el túnel en 4G;
+posteriormente el usuario confirmó simulación con datos siguiendo la secuencia indicada abajo.
 
-El test independiente `RoutePlaybackTimingChecks.swift` comprueba conversión de velocidad, límites, entradas no finitas, tiempo de regreso, continuidad entre ciclos y recorridos vacíos/cortos.
+La nueva revisión añade cancelación de envíos pendientes, reloj monótono para compensar latencia,
+regreso independiente en carro, búsqueda directa y elección de puntos en el mapa,
+y un enlace para abrir el destino en Waze. Tiene revisión de sintaxis local; **pendiente de
+compilación Swift/Xcode y de validación física en iPhone**. El IPA existente corresponde a 472e6f7.
+
+Los tests independientes comprueban velocidad y ciclos, compensación de latencia,
+rechazo de envíos obsoletos en cola, direcciones que no deben interpretarse como coordenadas
+y parámetros del enlace Waze.
 
 ## Compilar en macOS o GitHub Actions
 
@@ -41,7 +49,7 @@ swiftc StikDebug/Services/RoutePlaybackOptions.swift RoutePlaybackTimingChecks.s
 
 Para compilar sin tener una Mac propia, subir esta copia a un repositorio propio de GitHub y ejecutar manualmente el workflow **Build custom routes IPA**. Se incluye en `.github/workflows/custom_routes.yml`.
 Ese workflow ejecuta los tests anteriores, compila la app y adjunta `StikDebug-CustomRoutes.ipa` como artefacto. No publica releases ni envía cambios al repositorio original.
-Repositorio remoto: https://github.com/uyasanrodrigo-sudo/StikDebug-Rutas/tree/route-speed-repeat . La primera compilación (sin tráfico ni reutilización del túnel) terminó correctamente y pasó las pruebas de velocidad y ciclos: https://github.com/uyasanrodrigo-sudo/StikDebug-Rutas/actions/runs/40887135833 . Las mejoras posteriores requieren una nueva compilación y prueba física.
+Repositorio remoto: https://github.com/uyasanrodrigo-sudo/StikDebug-Rutas/tree/route-speed-repeat . La primera compilación (sin tráfico ni reutilización del túnel) terminó correctamente y pasó las pruebas de velocidad y ciclos: https://github.com/uyasanrodrigo-sudo/StikDebug-Rutas/actions/runs/40887135833 . La nueva revisión requiere su propia compilación y prueba física.
 El artefacto requiere firma mediante iLoader/SideStore antes de usarlo en el iPhone.
 
 ## Comprobaciones pendientes en iPhone
@@ -55,5 +63,44 @@ El artefacto requiere firma mediante iLoader/SideStore antes de usarlo en el iPh
 7. Probar segundo plano, pantalla bloqueada y datos móviles por separado.
 
 La cobertura de mapas y rutas depende de Apple Maps y la conexión. Recalcular no añade caminos que el proveedor no conozca.
-La repetición inversa simula coordenadas; no calcula un regreso distinto para respetar sentidos únicos de calles.
+El regreso independiente en carro usa las indicaciones de Apple Maps. Se rechazan huecos mayores de 30 metros entre extremos; los puntos ajustados por Apple a carriles cercanos se enlazan con conexiones cortas. Las rutas importadas conservan sus coordenadas, aunque se elija carro.
 Las restricciones de iOS sobre segundo plano y conexiones móviles siguen requiriendo pruebas reales.
+
+
+## Conexión con datos — 30 de octubre de 2026
+
+LocalDevVPN reconoce una limitación al crear sesiones en red celular:
+https://github.com/jkcoxson/LocalDevVPN/issues/31 . Otra implementación documenta
+la secuencia en https://github.com/seanhowarthdev/Roam-Control/blob/main/Documentation/UserGuide.md#mobile-data-connection-flow .
+El usuario confirmó que pudo cambiar y simular con datos móviles después de probar:
+
+1. Con datos encendidos, conectar LocalDevVPN.
+2. Apagar temporalmente solo Datos móviles, conservando la VPN.
+3. Establecer la conexión/simulación en StikDebug.
+4. Reactivar Datos móviles tras conectar correctamente.
+
+No se ha verificado persistencia después de reinicio, reconexión ni pantalla bloqueada.
+
+## Búsqueda de direcciones
+
+La app consulta Apple Maps; no tiene una lista pequeña de direcciones guardadas.
+El problema anterior era exigir una sugerencia y no buscar el texto al pulsar Enter.
+Ahora se puede buscar la dirección completa con ciudad/país, elegir uno de los resultados,
+escribir una pareja exacta latitud,longitud o seleccionar origen/destino en el mapa.
+Los errores de búsqueda explican estas alternativas. Los resultados tardíos se descartan si
+se edita el texto. La existencia de una dirección no garantiza cobertura de rutas del proveedor.
+La búsqueda principal muestra hasta 10 sugerencias; el formulario de rutas muestra las recibidas.
+
+## Waze y posible migración a Google Maps
+
+El enlace Waze usa la API oficial de enlaces:
+https://developers.google.com/waze/deeplinks . Abre el destino solo al pulsarlo; Waze calcula
+su propio recorrido. No importa rutas, tráfico ni estado de semáforos de Waze.
+
+Google Maps se está evaluando como una ampliación independiente. No está integrado ni se ha
+activado facturación. Requiere un proyecto Cloud con facturación, claves restringidas y revisar
+los cargos y condiciones de Maps SDK, Places y Routes. Los datos de rutas Google mostrados
+sobre un mapa deben aparecer en Google Maps. Referencias:
+- https://developers.google.com/maps/documentation/ios-sdk/get-api-key
+- https://developers.google.com/maps/documentation/routes/policies
+- https://developers.google.com/maps/billing-and-pricing/pricing

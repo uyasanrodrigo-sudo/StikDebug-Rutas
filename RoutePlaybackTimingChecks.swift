@@ -45,6 +45,44 @@ struct RoutePlaybackTimingChecks {
         near(RouteTrafficBehavior.signalStopDuration(chanceRoll: 0.2, durationRoll: 1, maximum: 45), 45)
         near(RouteTrafficBehavior.signalStopDuration(chanceRoll: 0.2, durationRoll: 0.5, maximum: 45), 25)
         near(RouteTrafficBehavior.signalStopDuration(chanceRoll: 0.2, durationRoll: 1, maximum: 500), 90)
-        print("Route timing checks passed")
+        // Socket latency below one tick should not accumulate across a route.
+        var deadline = 0.0
+        var elapsed = 0.0
+        for _ in 0..<20 {
+            deadline = RoutePlaybackTiming.nextDeadline(previous: deadline, interval: 0.5, elapsed: elapsed)
+            elapsed = deadline + 0.12
+        }
+        near(deadline, 10)
+        let stalled = RoutePlaybackTiming.nextDeadline(previous: 1, interval: 0.5, elapsed: 10)
+        near(stalled, 10)
+        near(RoutePlaybackTiming.nextDeadline(previous: stalled, interval: 0.5, elapsed: 10.1), 10.5)
+        near(Duration.milliseconds(250).timeInterval, 0.25)
+
+        // Old timer work already enqueued must be rejected after Stop, while
+        // work for the replacement location remains valid on the same queue.
+        let generation = LocationCommandGeneration()
+        let oldToken = generation.current()
+        let queue = DispatchQueue(label: "route-check.queued-stop")
+        queue.suspend()
+        queue.async { precondition(!generation.isCurrent(oldToken), "Stale location survived Stop") }
+        generation.invalidate()
+        let replacementToken = generation.current()
+        queue.async { precondition(generation.isCurrent(replacementToken), "New location was discarded") }
+        queue.resume()
+        queue.sync {}
+
+        let pair = CoordinateText.parse(" 4.6, -74.1 ")!
+        near(pair.latitude, 4.6)
+        near(pair.longitude, -74.1)
+        for invalid in ["Calle 26 # 10-30", "26, Bogota", "91,0", "0,-181", "nan,0", "4,5,6", ""] {
+            precondition(CoordinateText.parse(invalid) == nil)
+        }
+        let link = WazeDestinationLink.url(latitude: 4.6, longitude: -74.1)!
+        let components = URLComponents(url: link, resolvingAgainstBaseURL: false)!
+        precondition(components.scheme == "https" && components.host == "waze.com")
+        precondition(components.queryItems?.first(where: { $0.name == "ll" })?.value == "4.6,-74.1")
+        precondition(components.queryItems?.first(where: { $0.name == "navigate" })?.value == "yes")
+        precondition(WazeDestinationLink.url(latitude: .nan, longitude: 0) == nil)
+        print("Route timing, queued cancellation, address and Waze link checks passed")
     }
 }
