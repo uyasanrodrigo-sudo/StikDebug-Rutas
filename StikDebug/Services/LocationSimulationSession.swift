@@ -10,6 +10,7 @@ final class LocationSimulationSession: ObservableObject {
     @Published private(set) var routeCoordinates: [CLLocationCoordinate2D]?
     private var resendTimer: Timer?
     private var routeID: UUID?
+    let commandGeneration = LocationCommandGeneration()
 
     private init() {}
 
@@ -23,14 +24,22 @@ final class LocationSimulationSession: ObservableObject {
     }
 
     func startResending(at coordinate: CLLocationCoordinate2D, _ operation: @escaping () -> Void) {
+        pauseResending()
         start(at: coordinate)
-        resendTimer?.invalidate()
-        let timer = Timer(timeInterval: 4, repeats: true) { _ in operation() }
+        let generation = commandGeneration
+        let token = generation.current()
+        let timer = Timer(timeInterval: 4, repeats: true) { _ in
+            LocationSimulationCommandQueue.shared.async {
+                guard generation.isCurrent(token) else { return }
+                operation()
+            }
+        }
         RunLoop.main.add(timer, forMode: .common)
         resendTimer = timer
     }
 
     func startRoute(at coordinate: CLLocationCoordinate2D, coordinates: [CLLocationCoordinate2D]) -> UUID {
+        pauseResending()
         let routeID = UUID()
         self.routeID = routeID
         routeCoordinates = coordinates
@@ -43,11 +52,13 @@ final class LocationSimulationSession: ObservableObject {
     }
 
     func clearRoute() {
+        commandGeneration.invalidate()
         routeID = nil
         routeCoordinates = nil
     }
 
     func pauseResending() {
+        commandGeneration.invalidate()
         resendTimer?.invalidate()
         resendTimer = nil
     }
