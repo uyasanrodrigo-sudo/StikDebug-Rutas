@@ -2787,26 +2787,48 @@ private struct LocationSearchResultsSheet: View {
     @Environment(\.dismiss) private var dismiss
     let items: [MKMapItem]
     let onSelect: (MKMapItem) -> Void
+    @State private var selectedIndex: Int?
+    @State private var previewPosition: MapCameraPosition = .automatic
 
     var body: some View {
         NavigationStack {
-            List(items.indices, id: \.self) { index in
-                let item = items[index]
-                Button {
-                    onSelect(item)
-                    dismiss()
-                } label: {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(item.name ?? "Location").foregroundStyle(.primary)
-                        Text(item.placemark.title ?? "").font(.caption).foregroundStyle(.secondary)
-                        Text(String(format: "%.5f, %.5f", item.placemark.coordinate.latitude,
-                            item.placemark.coordinate.longitude)).font(.caption2.monospaced()).foregroundStyle(.secondary)
+            VStack(spacing: 0) {
+                if let selectedIndex, items.indices.contains(selectedIndex) {
+                    let item = items[selectedIndex]
+                    Map(position: $previewPosition) { Marker(item.name ?? "Location", coordinate: item.placemark.coordinate) }
+                        .frame(height: 180)
+                }
+                List(items.indices, id: \.self) { index in
+                    let item = items[index]
+                    Button {
+                        selectedIndex = index
+                        previewPosition = .region(MKCoordinateRegion(center: item.placemark.coordinate,
+                            latitudinalMeters: 1200, longitudinalMeters: 1200))
+                    } label: {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(item.name ?? "Location").foregroundStyle(.primary)
+                                Text(item.placemark.title ?? "").font(.caption).foregroundStyle(.secondary)
+                                Text(String(format: "%.5f, %.5f", item.placemark.coordinate.latitude,
+                                    item.placemark.coordinate.longitude)).font(.caption2.monospaced()).foregroundStyle(.secondary)
+                            }
+                            if selectedIndex == index { Image(systemName: "checkmark.circle.fill") }
+                        }
                     }
                 }
             }
             .navigationTitle("Choose an address")
             .navigationBarTitleDisplayMode(.inline)
-            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } } }
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Use location") {
+                        guard let selectedIndex, items.indices.contains(selectedIndex) else { return }
+                        onSelect(items[selectedIndex])
+                        dismiss()
+                    }.disabled(selectedIndex == nil)
+                }
+            }
         }
     }
 }
