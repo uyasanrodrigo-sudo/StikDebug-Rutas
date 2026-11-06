@@ -216,7 +216,11 @@ struct MainTabView: View {
 
         LocationSimulationSession.shared.pauseResending()
         LocationSimulationSession.shared.clearRoute()
+        LocationSimulationSession.shared.markConnecting()
+        let generation = LocationSimulationSession.shared.commandGeneration
+        let token = generation.current()
         LocationSimulationCommandQueue.shared.async {
+            guard generation.isCurrent(token) else { return }
             let code = simulate_location(
                 DeviceConnectionContext.targetIPAddress,
                 coordinate.latitude,
@@ -225,6 +229,7 @@ struct MainTabView: View {
             )
 
             DispatchQueue.main.async {
+                guard generation.isCurrent(token) else { return }
                 if code == 0 {
                     LocationSimulationSession.shared.clearRoute()
                     LocationSimulationSession.shared.startResending(
@@ -233,7 +238,7 @@ struct MainTabView: View {
                             longitude: coordinate.longitude
                         )
                     ) {
-                        _ = simulate_location(
+                        simulate_location(
                             DeviceConnectionContext.targetIPAddress,
                             coordinate.latitude,
                             coordinate.longitude,
@@ -244,6 +249,7 @@ struct MainTabView: View {
                         String(format: "Simulated location from URL: %.6f, %.6f", coordinate.latitude, coordinate.longitude)
                     )
                 } else {
+                    LocationSimulationSession.shared.recordFailure(locationSimulationErrorMessage(for: code))
                     showAlert(
                         title: "Location Simulation Failed",
                         message: locationSimulationErrorMessage(for: code),
@@ -255,13 +261,16 @@ struct MainTabView: View {
     }
 
     private func clearSimulatedLocation() {
-        LocationSimulationSession.shared.pauseResending()
-        LocationSimulationSession.shared.clearRoute()
+        LocationSimulationSession.shared.stop()
+        let generation = LocationSimulationSession.shared.commandGeneration
+        let token = generation.current()
         LocationSimulationCommandQueue.shared.async {
+            guard generation.isCurrent(token) else { return }
             let code = clear_simulated_location()
             DispatchQueue.main.async {
+                guard generation.isCurrent(token) else { return }
+                LocationSimulationSession.shared.confirmGPSRestoration(code == 0)
                 if code == 0 {
-                    LocationSimulationSession.shared.stop()
                     LogManager.shared.addInfoLog("Cleared simulated location from URL")
                 } else {
                     showAlert(

@@ -19,18 +19,8 @@ struct SettingsView: View {
     @AppStorage("keepAliveAudio") private var keepAliveAudio = true
     @AppStorage("keepAliveLocation") private var keepAliveLocation = true
     @AppStorage(UserDefaults.Keys.targetDeviceIP) private var targetDeviceIP = DeviceConnectionContext.defaultTargetIPAddress
-    @AppStorage("TunnelRemotePairingPort") private var remotePairingPortOverride = ""
     @AppStorage(UserDefaults.Keys.mallocDebug) private var mallocDebug = false
 
-    private enum ConnectionField: Hashable {
-        case address
-        case port
-    }
-
-    @FocusState private var focusedConnectionField: ConnectionField?
-    @State private var targetDeviceIPInput = ""
-    @State private var remotePairingPortInput = ""
-    @State private var automaticPortPlaceholder = "Discovering…"
     @State private var isShowingPairingFilePicker = false
     @State private var isImportingFile = false
     @State private var pairingImportMessage: (text: String, isError: Bool)?
@@ -155,23 +145,12 @@ struct SettingsView: View {
                     HStack {
                         Text("Target Device IP")
                         Spacer()
-                        TextField(DeviceConnectionContext.defaultTargetIPAddress, text: $targetDeviceIPInput)
+                        TextField(DeviceConnectionContext.defaultTargetIPAddress, text: $targetDeviceIP)
                             .multilineTextAlignment(.trailing)
                             .foregroundStyle(.secondary)
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled(true)
-                            .keyboardType(.decimalPad)
-                            .focused($focusedConnectionField, equals: .address)
-                            .frame(maxWidth: 160)
-                    }
-                    HStack {
-                        Text("Remote Pairing Port")
-                        Spacer()
-                        TextField(automaticPortPlaceholder, text: $remotePairingPortInput)
-                            .multilineTextAlignment(.trailing)
-                            .foregroundStyle(.secondary)
-                            .keyboardType(.numberPad)
-                            .focused($focusedConnectionField, equals: .port)
+                            .keyboardType(.numbersAndPunctuation)
                             .frame(maxWidth: 160)
                     }
                     Button { openAppFolder() } label: {
@@ -210,28 +189,6 @@ struct SettingsView: View {
                 }
             }
             .navigationTitle("Settings")
-            .background(KeyboardTapDismissal())
-            .scrollDismissesKeyboard(.interactively)
-        }
-        .onAppear {
-            targetDeviceIPInput = targetDeviceIP
-            remotePairingPortInput = remotePairingPortOverride
-        }
-        .task {
-            let result = await Task.detached {
-                RemotePairingPortResolver.discover()
-            }.value
-            automaticPortPlaceholder = result.source == "Bonjour"
-                ? "Bonjour (\(result.port))"
-                : "Fallback (\(result.port))"
-        }
-        .onChange(of: focusedConnectionField) { _, field in
-            if field == nil {
-                applyConnectionSettings()
-            }
-        }
-        .onDisappear {
-            applyConnectionSettings()
         }
         .fileImporter(
             isPresented: $isShowingPairingFilePicker,
@@ -273,15 +230,6 @@ struct SettingsView: View {
         }
     }
 
-    private func applyConnectionSettings() {
-        let address = targetDeviceIPInput.trimmingCharacters(in: .whitespacesAndNewlines)
-        let port = remotePairingPortInput.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard address != targetDeviceIP || port != remotePairingPortOverride else { return }
-        targetDeviceIP = address
-        remotePairingPortOverride = port
-        TunnelManager.shared.restart()
-    }
-
     private var versionFooter: String {
         let processInfo = ProcessInfo.processInfo
         let txmLabel: String
@@ -290,7 +238,10 @@ struct SettingsView: View {
         } else {
             txmLabel = processInfo.hasTXM ? "TXM" : "Non TXM"
         }
-        return "Version \(appVersion) • iOS \(UIDevice.current.systemVersion) • \(txmLabel)"
+        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "dev"
+        let revision = Bundle.main.infoDictionary?["StikRoutesRevision"] as? String ?? "local"
+        let builtAt = Bundle.main.infoDictionary?["StikRoutesBuiltAt"] as? String ?? "Local development"
+        return "StikDebug Rutas 2\nVersion \(appVersion) (\(build)) • \(revision.prefix(8))\n\(builtAt)\niOS \(UIDevice.current.systemVersion) • \(txmLabel)"
     }
 
     private func handleAudioKeepAliveChange(_ enabled: Bool) {
@@ -371,50 +322,6 @@ struct SettingsView: View {
                     ddiResultMessage = nil
                 }
             }
-        }
-    }
-}
-
-private struct KeyboardTapDismissal: UIViewRepresentable {
-    func makeUIView(context: Context) -> DismissalView {
-        DismissalView()
-    }
-
-    func updateUIView(_ uiView: DismissalView, context: Context) {}
-
-    final class DismissalView: UIView, UIGestureRecognizerDelegate {
-        private weak var attachedWindow: UIWindow?
-        private lazy var tapRecognizer: UITapGestureRecognizer = {
-            let recognizer = UITapGestureRecognizer(target: self, action: #selector(dismissKeyboard))
-            recognizer.cancelsTouchesInView = false
-            recognizer.delegate = self
-            return recognizer
-        }()
-
-        override func didMoveToWindow() {
-            super.didMoveToWindow()
-            attachedWindow?.removeGestureRecognizer(tapRecognizer)
-            attachedWindow = window
-            window?.addGestureRecognizer(tapRecognizer)
-        }
-
-        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
-            var view = touch.view
-            while let current = view {
-                if current is UITextField || current is UITextView || current is UIInputView {
-                    return false
-                }
-                view = current.superview
-            }
-            return true
-        }
-
-        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
-            true
-        }
-
-        @objc private func dismissKeyboard() {
-            window?.endEditing(true)
         }
     }
 }

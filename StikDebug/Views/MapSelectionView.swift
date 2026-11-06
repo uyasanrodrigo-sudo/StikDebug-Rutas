@@ -35,11 +35,27 @@ private enum RouteSearchField: String, Identifiable {
     var id: String { rawValue }
 }
 
+private struct RouteWaypoint: Identifiable {
+    var id = UUID()
+    var selection: RouteSearchSelection
+    var duration: Double = 60
+}
+
+private struct RouteTrafficLeg {
+    let start: CLLocationCoordinate2D
+    let end: CLLocationCoordinate2D
+    let distance: Double
+    let idealTime: Double
+}
+
 private struct RouteSimulationPlan {
     let displayCoordinates: [CLLocationCoordinate2D]
     let distance: CLLocationDistance
     let expectedTravelTime: TimeInterval
     var name: String = "Imported route"
+    var waypoints: [RouteWaypoint] = []
+    var scheduledStops: [RouteScheduledStop] = []
+    var trafficLegs: [RouteTrafficLeg] = []
 }
 
 private enum RouteSimulationDefaults {
@@ -53,6 +69,17 @@ private struct RoutePlaybackSample {
     let coordinate: CLLocationCoordinate2D
     let delayFromPrevious: TimeInterval
     var isTrafficSignal: Bool = false
+    var distanceFromPrevious: Double = 0
+    var speedMetersPerSecond: Double = 5 / 3.6
+}
+
+private func streamingPath(_ samples: [RoutePlaybackSample]) -> RouteStreamPath? {
+    RouteStreamPath(
+        points: samples.map { RouteMotionPoint(latitude: $0.coordinate.latitude, longitude: $0.coordinate.longitude) },
+        distances: samples.dropFirst().map(\.distanceFromPrevious),
+        speeds: samples.dropFirst().map(\.speedMetersPerSecond),
+        signalIndices: samples.indices.filter { samples[$0].isTrafficSignal }
+    )
 }
 
 private func preparedSamples(
@@ -73,6 +100,9 @@ private func preparedSamples(
 private func drivingReturnPlan(for plan: RouteSimulationPlan) async throws -> RouteSimulationPlan {
     guard let start = plan.displayCoordinates.last, let end = plan.displayCoordinates.first else {
         throw URLError(.badURL)
+    }
+    if !plan.waypoints.isEmpty {
+        return try await multiStopPlan(start: start, end: end, waypoints: Array(plan.waypoints.reversed()), mode: .driving)
     }
     let request = MKDirections.Request()
     request.source = MKMapItem(placemark: MKPlacemark(coordinate: start))
@@ -107,14 +137,76 @@ private func drivingReturnPlan(for plan: RouteSimulationPlan) async throws -> Ro
         expectedTravelTime: route.expectedTravelTime, name: route.name)
 }
 
+// Calculate each consecutive leg so every selected stop is part of the path.
+// Short lane snaps are connected; larger mismatches fail instead of teleporting.
+private func multiStopPlan(start: CLLocationCoordinate2D, end: CLLocationCoordinate2D,
+                           waypoints: [RouteWaypoint], mode: RouteTravelMode) async throws -> RouteSimulationPlan {
+    guard waypoints.count <= RouteStopSchedule.maximumWaypoints,
+          waypoints.allSatisfy({ RouteStopSchedule.validDuration($0.duration) }) else { throw URLError(.badURL) }
+    let endpoints = [start] + waypoints.map { $0.selection.coordinate } + [end]
+    var coordinates: [CLLocationCoordinate2D] = []
+    var stops: [RouteScheduledStop] = []
+    var legs: [RouteTrafficLeg] = []
+    var distance = 0.0, idealTime = 0.0, geometryDistance = 0.0
+    for index in 0..<(endpoints.count - 1) {
+        try Task.checkCancellation()
+        let source = endpoints[index], destination = endpoints[index + 1]
+        guard distanceAlong([source, destination]) >= 1 else {
+            throw NSError(domain: "RouteSimulation", code: -3, userInfo: [NSLocalizedDescriptionKey:
+                "Consecutive stops must be at least one metre apart. Edit or remove the duplicate point."])
+        }
+        let request = MKDirections.Request()
+        request.source = MKMapItem(placemark: MKPlacemark(coordinate: source))
+        request.destination = MKMapItem(placemark: MKPlacemark(coordinate: destination))
+        request.transportType = mode == .walking ? .walking : .automobile
+        let directions = MKDirections(request: request)
+        let timeout = Task {
+            do { try await Task.sleep(for: .seconds(20)) } catch { return }
+            directions.cancel()
+        }
+        let response: MKDirections.Response
+        do {
+            response = try await withTaskCancellationHandler { try await directions.calculate() } onCancel: { directions.cancel() }
+            timeout.cancel()
+        } catch { timeout.cancel(); throw error }
+        try Task.checkCancellation()
+        guard let route = response.routes.first else { throw URLError(.resourceUnavailable) }
+        var part = sampledRouteCoordinates(from: route.polyline.coordinateArray,
+            targetDistance: RouteSimulationDefaults.pathSamplingDistance)
+        guard let first = part.first, let last = part.last, part.count > 1,
+              distanceAlong([source, first]) <= 30, distanceAlong([last, destination]) <= 30 else {
+            throw NSError(domain: "RouteSimulation", code: -4, userInfo: [NSLocalizedDescriptionKey:
+                "Apple Maps could not reach stop \(index + 1) within 30 metres. Move the point onto an accessible road or path."])
+        }
+        if CoordinateSnapshot(first) != CoordinateSnapshot(source) { part.insert(source, at: 0) }
+        if CoordinateSnapshot(last) != CoordinateSnapshot(destination) { part.append(destination) }
+        geometryDistance += distanceAlong(part)
+        if coordinates.isEmpty { coordinates = part } else { coordinates.append(contentsOf: part.dropFirst()) }
+        guard coordinates.count <= 100_000 else { throw CoordinateImportError.tooLarge }
+        distance += route.distance
+        idealTime += route.expectedTravelTime
+        legs.append(RouteTrafficLeg(start: source, end: destination, distance: route.distance, idealTime: route.expectedTravelTime))
+        if index < waypoints.count {
+            stops.append(RouteScheduledStop(distance: geometryDistance, duration: waypoints[index].duration,
+                title: "Stop \(index + 1): " + waypoints[index].selection.title))
+        }
+    }
+    return RouteSimulationPlan(displayCoordinates: coordinates, distance: distance,
+        expectedTravelTime: idealTime, name: "Route with \(waypoints.count) stops",
+        waypoints: waypoints, scheduledStops: stops, trafficLegs: legs)
+}
+
 private struct RoadContext {
     var ways: [OpenStreetMapWay] = []
     var signals: [CLLocationCoordinate2D] = []
 }
 
 private struct OpenStreetMapWay {
+    let id: Int64
     let geometry: [CLLocationCoordinate2D]
-    let speedLimitMetersPerSecond: CLLocationSpeed
+    let genericSpeed: Double?
+    let forwardSpeed: Double?
+    let backwardSpeed: Double?
 }
 
 private enum OpenStreetMapSpeedLimitService {
@@ -128,6 +220,7 @@ private struct OverpassResponse: Decodable {
     let elements: [Element]
 
     struct Element: Decodable {
+        let id: Int64?
         let tags: [String: String]?
         let geometry: [Coordinate]?
         let lat: Double?
@@ -172,7 +265,9 @@ private func sampledRouteCoordinates(
     for (start, end) in zip(coordinates, coordinates.dropFirst()) {
         let distance = CLLocation(latitude: start.latitude, longitude: start.longitude)
             .distance(from: CLLocation(latitude: end.latitude, longitude: end.longitude))
+        guard !Task.isCancelled, distance.isFinite else { return [] }
         let segmentCount = max(1, Int(ceil(distance / targetDistance)))
+        guard sampled.count + segmentCount <= 100_000 else { return [] }
         for index in 1...segmentCount {
             let point = interpolateCoordinate(
                 from: start,
@@ -238,7 +333,7 @@ private func parseSpeedLimitMetersPerSecond(from rawValue: String) -> CLLocation
     }
 
     let scanner = Scanner(string: normalized)
-    guard let numericValue = scanner.scanDouble() else { return nil }
+    guard let numericValue = scanner.scanDouble(), numericValue.isFinite, numericValue > 0 else { return nil }
 
     if normalized.contains("mph") {
         return numericValue * 0.44704
@@ -248,23 +343,6 @@ private func parseSpeedLimitMetersPerSecond(from rawValue: String) -> CLLocation
     }
 
     return numericValue / 3.6
-}
-
-private func speedLimitMetersPerSecond(from tags: [String: String]) -> CLLocationSpeed? {
-    if let maxspeed = tags["maxspeed"],
-       let parsed = parseSpeedLimitMetersPerSecond(from: maxspeed) {
-        return parsed
-    }
-
-    let directionalValues = [
-        tags["maxspeed:forward"],
-        tags["maxspeed:backward"]
-    ]
-        .compactMap { $0 }
-        .compactMap(parseSpeedLimitMetersPerSecond(from:))
-
-    guard !directionalValues.isEmpty else { return nil }
-    return directionalValues.min()
 }
 
 private func overpassQuery(for coordinates: [CLLocationCoordinate2D]) -> String? {
@@ -324,15 +402,16 @@ private func fetchRoadContext(for coordinates: [CLLocationCoordinate2D]) async t
     let decoded = try JSONDecoder().decode(OverpassResponse.self, from: data)
     let ways = decoded.elements.compactMap { element -> OpenStreetMapWay? in
         guard let tags = element.tags,
-              let speedLimit = speedLimitMetersPerSecond(from: tags),
               let geometry = element.geometry?.map({ CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon) }),
               geometry.count > 1 else {
             return nil
         }
 
         return OpenStreetMapWay(
-            geometry: geometry,
-            speedLimitMetersPerSecond: speedLimit
+            id: element.id ?? 0, geometry: geometry,
+            genericSpeed: tags["maxspeed"].flatMap(parseSpeedLimitMetersPerSecond),
+            forwardSpeed: tags["maxspeed:forward"].flatMap(parseSpeedLimitMetersPerSecond),
+            backwardSpeed: tags["maxspeed:backward"].flatMap(parseSpeedLimitMetersPerSecond)
         )
     }
     let signals = decoded.elements.compactMap { element -> CLLocationCoordinate2D? in
@@ -344,68 +423,51 @@ private func fetchRoadContext(for coordinates: [CLLocationCoordinate2D]) async t
 }
 
 private func nearestSpeedLimit(
-    forSegmentFrom start: CLLocationCoordinate2D,
-    to end: CLLocationCoordinate2D,
-    using ways: [OpenStreetMapWay]
+    forSegmentFrom start: CLLocationCoordinate2D, to end: CLLocationCoordinate2D,
+    using ways: [OpenStreetMapWay], previousWay: inout Int64?
 ) -> CLLocationSpeed? {
     let midpoint = MKMapPoint(midpointCoordinate(from: start, to: end))
-    var bestMatch: (speed: CLLocationSpeed, distance: CLLocationDistance)?
-
+    let from = MKMapPoint(start), to = MKMapPoint(end)
+    let dx = to.x - from.x, dy = to.y - from.y
+    var best: (speed: Double, score: Double, way: Int64)?
     for way in ways {
-        for (wayStart, wayEnd) in zip(way.geometry, way.geometry.dropFirst()) {
-            let candidateDistance = distanceFromPoint(
-                midpoint,
-                toSegmentFrom: MKMapPoint(wayStart),
-                to: MKMapPoint(wayEnd)
-            )
-
-            if bestMatch == nil || candidateDistance < bestMatch!.distance {
-                bestMatch = (way.speedLimitMetersPerSecond, candidateDistance)
-            }
+        guard !Task.isCancelled else { return nil }
+        for (a, b) in zip(way.geometry, way.geometry.dropFirst()) {
+            let a = MKMapPoint(a), b = MKMapPoint(b)
+            let wx = b.x - a.x, wy = b.y - a.y
+            let denominator = hypot(dx, dy) * hypot(wx, wy)
+            guard denominator > 0 else { continue }
+            let alignment = (dx * wx + dy * wy) / denominator
+            let separation = distanceFromPoint(midpoint, toSegmentFrom: a, to: b)
+            guard let score = RouteRoadMatching.score(distance: separation, alignment: alignment, sameWay: previousWay == way.id),
+                  let speed = RouteRoadMatching.speed(generic: way.genericSpeed, forward: way.forwardSpeed,
+                      backward: way.backwardSpeed, alignment: alignment) else { continue }
+            if best == nil || score < best!.score { best = (speed, score, way.id) }
         }
     }
-
-    guard let bestMatch,
-          bestMatch.distance <= OpenStreetMapSpeedLimitService.nearestWayThreshold else {
-        return nil
-    }
-
-    return bestMatch.speed
+    if let best { previousWay = best.way }
+    return best?.speed
 }
 
 private func buildPlaybackSamples(
-    from displayCoordinates: [CLLocationCoordinate2D],
-    speedWays: [OpenStreetMapWay],
+    from displayCoordinates: [CLLocationCoordinate2D], speedWays: [OpenStreetMapWay],
     fallbackSpeedMetersPerSecond: CLLocationSpeed
 ) -> [RoutePlaybackSample] {
-    guard let firstCoordinate = displayCoordinates.first else { return [] }
-
-    var samples = [RoutePlaybackSample(coordinate: firstCoordinate, delayFromPrevious: 0)]
-
+    guard let first = displayCoordinates.first, displayCoordinates.count <= 100_000 else { return [] }
+    let fallback = fallbackSpeedMetersPerSecond.isFinite && fallbackSpeedMetersPerSecond > 0
+        ? min(200 / 3.6, max(0.5 / 3.6, fallbackSpeedMetersPerSecond)) : 5 / 3.6
+    var samples = [RoutePlaybackSample(coordinate: first, delayFromPrevious: 0, speedMetersPerSecond: fallback)]
+    var previousWay: Int64?
     for (start, end) in zip(displayCoordinates, displayCoordinates.dropFirst()) {
         guard !Task.isCancelled else { return [] }
-        let segmentDistance = CLLocation(latitude: start.latitude, longitude: start.longitude)
+        let distance = CLLocation(latitude: start.latitude, longitude: start.longitude)
             .distance(from: CLLocation(latitude: end.latitude, longitude: end.longitude))
-        guard segmentDistance > 0 else { continue }
-
-        let speedLimit = nearestSpeedLimit(forSegmentFrom: start, to: end, using: speedWays) ?? fallbackSpeedMetersPerSecond
-        let clampedSpeed = max(speedLimit, RouteSimulationDefaults.minimumSpeedMetersPerSecond)
-        let segmentTravelTime = segmentDistance / clampedSpeed
-        let segmentStepCount = max(1, Int(ceil(segmentTravelTime / RouteSimulationDefaults.playbackTickInterval)))
-        let stepDelay = segmentTravelTime / Double(segmentStepCount)
-
-        for index in 1...segmentStepCount {
-            let coordinate = interpolateCoordinate(
-                from: start,
-                to: end,
-                fraction: Double(index) / Double(segmentStepCount)
-            )
-            if samples.last.map({ CoordinateSnapshot($0.coordinate) }) != CoordinateSnapshot(coordinate) {
-                samples.append(RoutePlaybackSample(coordinate: coordinate, delayFromPrevious: stepDelay))
-            }
-        }
+        guard distance.isFinite, distance > 0 else { continue }
+        let speed = nearestSpeedLimit(forSegmentFrom: start, to: end, using: speedWays,
+            previousWay: &previousWay) ?? fallback
+        samples.append(RoutePlaybackSample(coordinate: end, delayFromPrevious: distance / speed,
+            distanceFromPrevious: distance, speedMetersPerSecond: speed))
     }
-
     return samples
 }
 
@@ -425,39 +487,36 @@ private func prefetchRoutePlaybackSamples(
     )
     guard includeSignals, samples.count > 2 else { return samples }
 
-    // Map known signal nodes to the closest route sample. Cluster nearby nodes
-    // so several signal poles at one junction produce a single potential stop.
-    var assignedCoordinates: [CLLocation] = []
+    var offsets = [0.0]
+    for sample in samples.dropFirst() { offsets.append(offsets.last! + sample.distanceFromPrevious) }
+    var candidates: [(index: Int, offset: Double, separation: Double)] = []
     for signal in context.signals {
         guard !Task.isCancelled else { return [] }
         let location = CLLocation(latitude: signal.latitude, longitude: signal.longitude)
-        var bestIndex: Int?
-        var bestDistance = 20.0
+        let separations = samples.map { location.distance(from: CLLocation(
+            latitude: $0.coordinate.latitude, longitude: $0.coordinate.longitude)) }
         for index in 1..<(samples.count - 1) {
-            let sample = samples[index].coordinate
-            let distance = location.distance(from: CLLocation(latitude: sample.latitude, longitude: sample.longitude))
-            if distance < bestDistance {
-                bestIndex = index
-                bestDistance = distance
+            // Each local minimum can be a separate visit, even at a junction
+            // already crossed earlier in this leg.
+            if separations[index] < 20 && separations[index] <= separations[index - 1]
+                && separations[index] < separations[index + 1] {
+                candidates.append((index, offsets[index], separations[index]))
             }
         }
-        if let bestIndex {
-            let coordinate = samples[bestIndex].coordinate
-            let stop = CLLocation(latitude: coordinate.latitude, longitude: coordinate.longitude)
-            guard !assignedCoordinates.contains(where: { $0.distance(from: stop) < 35 }) else { continue }
-            samples[bestIndex].isTrafficSignal = true
-            assignedCoordinates.append(stop)
-        }
     }
+    for index in RouteSignalVisits.clustered(candidates) { samples[index].isTrafficSignal = true }
     return samples
 }
 
 private enum CoordinateImportError: LocalizedError {
     case emptyFile
     case noCoordinates
+    case tooLarge
 
     var errorDescription: String? {
         switch self {
+        case .tooLarge:
+            return "This route is too large. Use a file under 20 MB and a path with at most 100,000 vertices."
         case .emptyFile:
             return "The selected file is empty."
         case .noCoordinates:
@@ -490,7 +549,11 @@ private enum CoordinateImportParser {
             }
         }
 
+        if let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize, size > 20_000_000 {
+            throw CoordinateImportError.tooLarge
+        }
         let data = try Data(contentsOf: url)
+        guard data.count <= 20_000_000 else { throw CoordinateImportError.tooLarge }
         guard !data.isEmpty else { throw CoordinateImportError.emptyFile }
 
         let fileExtension = url.pathExtension.lowercased()
@@ -838,6 +901,12 @@ struct LocationSimulationView: View {
     @State private var routeSpeedPrefetchTask: Task<Void, Never>?
     @State private var routePlaybackTask: Task<Void, Never>?
     @State private var isBusy = false
+    @State private var isStopping = false
+    @State private var locationCommandID = UUID()
+    @State private var reconnectTask: Task<Void, Never>?
+    @State private var resolvedSearchItems: [MKMapItem] = []
+    @State private var showResolvedSearch = false
+    @State private var trafficEstimateDate: Date?
     @State private var isLoadingRoute = false
     @State private var isPrefetchingRouteSpeeds = false
     @State private var isImportingCoordinates = false
@@ -853,6 +922,7 @@ struct LocationSimulationView: View {
     @State private var showRouteSearch = false
     @State private var routeStartSelection: RouteSearchSelection?
     @State private var routeEndSelection: RouteSearchSelection?
+    @State private var routeWaypoints: [RouteWaypoint] = []
     @State private var routePlan: RouteSimulationPlan?
     @State private var returnRoutePlan: RouteSimulationPlan?
     @State private var returnPlaybackSamples: [RoutePlaybackSample] = []
@@ -862,18 +932,18 @@ struct LocationSimulationView: View {
     @State private var simulatedCoordinate: CLLocationCoordinate2D?
     @State private var routeRequestID = UUID()
     @State private var preparationID = UUID()
-    @State private var travelMode: RouteTravelMode = .walking
-    @State private var automaticSpeed = true
-    @State private var customSpeedKilometersPerHour = 5.0
-    @State private var repeatRoundTrip = false
+    @AppStorage("routes.travelMode") private var travelMode: RouteTravelMode = .walking
+    @AppStorage("routes.automaticSpeed") private var automaticSpeed = true
+    @AppStorage("routes.customSpeedKilometersPerHour") private var customSpeedKilometersPerHour = 5.0
+    @AppStorage("routes.repeatRoundTrip") private var repeatRoundTrip = false
     @State private var showRouteOptions = false
     @State private var useSatelliteMap = false
     @State private var alternativeRoutes: [RouteSimulationPlan] = []
     @State private var selectedRouteIndex = 0
     @State private var isImportedRoute = false
-    @State private var simulateSignalStops = true
-    @State private var maximumSignalStop = 45.0
-    @State private var useTrafficEstimate = true
+    @AppStorage("routes.simulateSignalStops") private var simulateSignalStops = true
+    @AppStorage("routes.maximumSignalStop") private var maximumSignalStop = 45.0
+    @AppStorage("routes.useTrafficEstimate") private var useTrafficEstimate = true
     @State private var trafficDelayMultiplier = 1.0
     @State private var trafficStatus = "Traffic estimate not loaded."
     @State private var playbackStatus: String?
@@ -914,7 +984,8 @@ struct LocationSimulationView: View {
     }
 
     private var hasActiveSimulation: Bool {
-        simulationSession.isActive || simulatedCoordinate != nil || routePlaybackTask != nil
+        simulationSession.connectionState != .stopped || simulationSession.gpsRestorationConfirmed == false ||
+            simulationSession.isActive || simulatedCoordinate != nil || routePlaybackTask != nil
     }
 
     private var isRouteRunning: Bool {
@@ -941,9 +1012,10 @@ struct LocationSimulationView: View {
             value: routePlan.distance / 1000,
             unit: UnitLength.kilometers
         ).formatted(.measurement(width: .abbreviated, usage: .road))
-        let duration = routePlaybackSamples.isEmpty
+        let duration = (routePlaybackSamples.isEmpty
             ? routePlan.expectedTravelTime
-            : routePlaybackSamples.reduce(0) { $0 + $1.delayFromPrevious }
+            : routePlaybackSamples.reduce(0) { $0 + $1.delayFromPrevious })
+            + routePlan.scheduledStops.reduce(0) { $0 + $1.duration }
         let durationText = Self.routeDurationFormatter.string(from: duration)
         if let durationText, !durationText.isEmpty {
             return "\(distanceText) • ETA \(durationText)"
@@ -1030,6 +1102,9 @@ struct LocationSimulationView: View {
                             Marker("Start", coordinate: routeStartCoordinate)
                                 .tint(.green)
                         }
+                        ForEach(Array(routeWaypoints.enumerated()), id: \.element.id) { index, stop in
+                            Marker("Stop \(index + 1)", coordinate: stop.selection.coordinate).tint(.purple)
+                        }
                         if let routeEndCoordinate {
                             Marker("End", coordinate: routeEndCoordinate)
                                 .tint(.red)
@@ -1078,6 +1153,7 @@ struct LocationSimulationView: View {
                 Spacer()
 
                 VStack(spacing: 12) {
+                    connectionStatusControls
                     if isImportingCoordinates {
                         ProgressView("Importing coordinates…")
                             .font(.footnote)
@@ -1163,12 +1239,20 @@ struct LocationSimulationView: View {
             RouteSearchSheet(
                 initialStart: routeStartSelection,
                 initialEnd: routeEndSelection,
+                initialWaypoints: routeWaypoints,
                 searchRegion: searchRegion
-            ) { startSelection, endSelection in
+            ) { startSelection, endSelection, waypoints in
                 routeStartSelection = startSelection
                 routeEndSelection = endSelection
+                routeWaypoints = waypoints
                 isImportedRoute = false
                 refreshRoute()
+            }
+        }
+        .sheet(isPresented: $showResolvedSearch) {
+            LocationSearchResultsSheet(items: resolvedSearchItems) { item in
+                applySelection(item.placemark.coordinate)
+                showResolvedSearch = false
             }
         }
         .sheet(isPresented: $showRouteOptions) {
@@ -1226,6 +1310,10 @@ struct LocationSimulationView: View {
                 coordinate = activeCoordinate
                 simulatedCoordinate = activeCoordinate
             }
+            if !isRouteRunning {
+                if routePlan != nil, routePlaybackSamples.isEmpty { prepareRoutePlayback() }
+                else if routePlan == nil, routeStartSelection != nil, routeEndSelection != nil { refreshRoute() }
+            }
         }
         .onDisappear {
             routeLoadTask?.cancel()
@@ -1234,6 +1322,7 @@ struct LocationSimulationView: View {
             routeSpeedPrefetchTask = nil
             routeRequestID = UUID()
             preparationID = UUID()
+            searchRequestID = UUID()
             isLoadingRoute = false
             isPrefetchingRouteSpeeds = false
             endBackgroundTask()
@@ -1333,10 +1422,11 @@ struct LocationSimulationView: View {
             do {
                 let items = try await searchAddress(query, region: region)
                 guard searchRequestID == requestID, searchText == input, !isRouteRunning else { return }
-                guard let item = items.first else { throw URLError(.resourceUnavailable) }
+                guard !items.isEmpty else { throw URLError(.resourceUnavailable) }
                 searchText = ""
                 searchCompleter.results = []
-                applySelection(item.placemark.coordinate)
+                resolvedSearchItems = items
+                showResolvedSearch = true
             } catch {
                 guard searchRequestID == requestID, searchText == input else { return }
                 alertTitle = "Address Not Found"
@@ -1384,6 +1474,10 @@ struct LocationSimulationView: View {
     ) {
         guard !isRouteRunning else { return }
 
+        guard importedCoordinates.count <= 100_000 else {
+            showImportError(CoordinateImportError.tooLarge)
+            return
+        }
         let coordinates = importedCoordinates.filter(CLLocationCoordinate2DIsValid)
         guard let firstCoordinate = coordinates.first else {
             showImportError(CoordinateImportError.noCoordinates)
@@ -1414,12 +1508,13 @@ struct LocationSimulationView: View {
 
         guard displayCoordinates.count > 1,
               let lastCoordinate = displayCoordinates.last else {
-            applySelection(firstCoordinate)
+            showImportError(CoordinateImportError.tooLarge)
             return
         }
 
         let distance = distanceAlong(displayCoordinates)
         let fallbackSpeed = RouteSimulationDefaults.importedRouteFallbackSpeedMetersPerSecond
+        routeWaypoints = []
         routeStartSelection = RouteSearchSelection(title: "\(sourceName) Start", coordinate: firstCoordinate)
         routeEndSelection = RouteSearchSelection(title: "\(sourceName) End", coordinate: lastCoordinate)
         setRoutePlan(RouteSimulationPlan(
@@ -1443,6 +1538,35 @@ struct LocationSimulationView: View {
         showAlert = true
     }
 
+    private var connectionStatusControls: some View {
+        VStack(spacing: 4) {
+            HStack {
+                Text(simulationSession.connectionState.rawValue).font(.caption.weight(.semibold))
+                if simulationSession.connectionState == .connecting { ProgressView().controlSize(.mini) }
+                if simulationSession.connectionState == .disconnected {
+                    Button("Retry connection", action: retryConnection).font(.caption)
+                }
+            }
+            if let date = simulationSession.lastSuccessfulUpdate {
+                HStack(spacing: 4) {
+                    Text("Last successful update")
+                    Text(date, style: .time)
+                }.font(.caption2).foregroundStyle(.secondary)
+            }
+            if let message = simulationSession.gpsRestorationMessage {
+                Text(message).font(.caption2).foregroundStyle(.secondary)
+            }
+            if let failure = simulationSession.lastFailure {
+                DisclosureGroup("Connection details") {
+                    Text(failure).font(.caption2).textSelection(.enabled)
+                    Text("Target IP: " + deviceIP).font(.caption2)
+                    Text("Last pairing lookup: " + RemotePairingPortResolver.lastAttemptDescription).font(.caption2)
+                    Text(pairingExists ? "Pairing file available." : "Pairing file missing.").font(.caption2)
+                }.font(.caption)
+            }
+        }
+    }
+
     @ViewBuilder
     private var pinControls: some View {
         if let coord = coordinate {
@@ -1454,7 +1578,7 @@ struct LocationSimulationView: View {
                 Button("Stop", action: clear)
                     .buttonStyle(.bordered)
                     .tint(.red)
-                    .disabled(!pairingExists || isBusy || !hasActiveSimulation)
+                    .disabled(isStopping || !hasActiveSimulation)
 
                 Button("Simulate Location", action: simulate)
                     .buttonStyle(.borderedProminent)
@@ -1491,6 +1615,10 @@ struct LocationSimulationView: View {
                     .foregroundStyle(.secondary)
             }
 
+            if let plan = routePlan, !plan.waypoints.isEmpty {
+                Text("\(plan.waypoints.count) scheduled stops · \(Int(plan.scheduledStops.reduce(0) { $0 + $1.duration })) seconds waiting per direction")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             if automaticSpeed && travelMode == .driving {
                 routeAttributionLink
             }
@@ -1517,6 +1645,13 @@ struct LocationSimulationView: View {
                 Text(useTrafficEstimate ? trafficStatus : "Traffic adjustment off.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                if let trafficEstimateDate {
+                    HStack {
+                        Text("Traffic estimate updated")
+                        Text(trafficEstimateDate, style: .relative)
+                    }
+                    .font(.caption2).foregroundStyle(.secondary)
+                }
                 if simulateSignalStops {
                     Text("Mapped signals: \(routePlaybackSamples.filter(\.isTrafficSignal).count). Stops are simulated.")
                         .font(.caption)
@@ -1540,11 +1675,34 @@ struct LocationSimulationView: View {
                     .foregroundStyle(.secondary)
             }
 
+            if simulationSession.routeCoordinates != nil {
+                if simulationSession.stopSecondsRemaining > 0 {
+                    Text("\(simulationSession.stopTitle) · \(Int(ceil(simulationSession.stopSecondsRemaining))) s" +
+                        (simulationSession.isPaused ? " (paused)" : ""))
+                        .font(.caption).monospacedDigit()
+                }
+                ProgressView(value: simulationSession.legProgress)
+                Text(String(format: "%@ · %.1f km/h · %.2f km left · %d round trips",
+                    simulationSession.returning ? "Return" : "Outward",
+                    simulationSession.currentSpeedKilometersPerHour,
+                    simulationSession.remainingDistance / 1000, simulationSession.completedRoundTrips))
+                    .font(.caption.monospaced())
+                if let eta = Self.routeDurationFormatter.string(from: simulationSession.remainingTime) {
+                    Text("Approx. time to this leg's end: " + eta + (simulationSession.isPaused ? " (paused)" : ""))
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Button(simulationSession.isPaused ? "Resume" : "Pause") {
+                    simulationSession.togglePause()
+                }
+                .buttonStyle(.bordered)
+                .disabled(simulationSession.connectionState == .disconnected || simulationSession.connectionState == .connecting)
+            }
+
             HStack(spacing: 12) {
                 Button("Stop", action: clear)
                     .buttonStyle(.bordered)
                     .tint(.red)
-                    .disabled(!pairingExists || isBusy || !hasActiveSimulation)
+                    .disabled(isStopping || !hasActiveSimulation)
 
                 Button("Play Route", action: simulateRoute)
                     .buttonStyle(.borderedProminent)
@@ -1617,8 +1775,8 @@ struct LocationSimulationView: View {
                 }
 
                 Section("Mobile data connection") {
-                    Text("If connection fails on mobile data: connect LocalDevVPN with data on, temporarily turn off only Mobile Data while keeping the VPN active, connect or simulate in StikDebug, then turn Mobile Data back on after it succeeds.")
-                    Text("This sequence worked on the tested iPhone. You may need to repeat it after losing the session. Do not use Airplane Mode for this sequence.")
+                    Text(MobileDataConnectionGuide.instructions)
+                    Text(MobileDataConnectionGuide.limitation)
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
@@ -1643,6 +1801,7 @@ struct LocationSimulationView: View {
         guard pairingExists, let coord = coordinate, !isBusy else { return }
         stopResendLoop()
         LocationSimulationSession.shared.clearRoute()
+        simulationSession.markConnecting()
         runLocationCommand(
             errorTitle: "Simulation Failed",
             errorMessage: { code in
@@ -1667,6 +1826,7 @@ struct LocationSimulationView: View {
         }
         stopResendLoop()
         cancelRoutePlayback(resetMarker: false)
+        simulationSession.markConnecting()
         runLocationCommand(
             errorTitle: "Route Simulation Failed",
             errorMessage: { code in
@@ -1690,19 +1850,23 @@ struct LocationSimulationView: View {
     }
 
     private func runLocationCommand(
-        errorTitle: String,
-        errorMessage: @escaping (Int32) -> String,
-        operation: @escaping () -> Int32,
-        onSuccess: @escaping () -> Void
+        errorTitle: String, errorMessage: @escaping (Int32) -> String,
+        operation: @escaping () -> Int32, onSuccess: @escaping () -> Void
     ) {
+        let requestID = UUID()
+        locationCommandID = requestID
+        let generation = simulationSession.commandGeneration
+        let token = generation.current()
         isBusy = true
         LocationSimulationCommandQueue.shared.async {
-            let code = operation()
+            let code = generation.isCurrent(token) ? operation() : Int32(-999)
             DispatchQueue.main.async {
+                guard locationCommandID == requestID else { return }
                 isBusy = false
-                if code == 0 {
-                    onSuccess()
-                } else {
+                guard generation.isCurrent(token) else { return }
+                if code == 0 { onSuccess() }
+                else {
+                    simulationSession.recordFailure(errorMessage(code))
                     alertTitle = errorTitle
                     alertMessage = errorMessage(code)
                     showAlert = true
@@ -1712,28 +1876,38 @@ struct LocationSimulationView: View {
     }
 
     private func clear() {
-        guard pairingExists, !isBusy else { return }
+        guard !isStopping else { return }
         routeLoadTask?.cancel()
         routeLoadTask = nil
         routeSpeedPrefetchTask?.cancel()
         routeSpeedPrefetchTask = nil
+        reconnectTask?.cancel()
+        reconnectTask = nil
         preparationID = UUID()
         routeRequestID = UUID()
+        locationCommandID = UUID()
         isLoadingRoute = false
         isPrefetchingRouteSpeeds = false
+        isBusy = false
         cancelRoutePlayback(resetMarker: true)
         trafficRequest?.cancel()
         trafficRequest = nil
         playbackStatus = nil
         stopResendLoop()
-        LocationSimulationSession.shared.clearRoute()
-        runLocationCommand(
-            errorTitle: "Clear Failed",
-            errorMessage: { code in "Could not clear simulated location (error \(code))." },
-            operation: clear_simulated_location
-        ) {
-            endBackgroundTask()
-            LocationSimulationSession.shared.stop()
+        // Stop all local work immediately, even without pairing or a live
+        // location service. The remote reset is a separate confirmation.
+        simulationSession.stop()
+        endBackgroundTask()
+        let generation = simulationSession.commandGeneration
+        let token = generation.current()
+        isStopping = true
+        LocationSimulationCommandQueue.shared.async {
+            let code = generation.isCurrent(token) ? clear_simulated_location() : Int32(-999)
+            DispatchQueue.main.async {
+                isStopping = false
+                guard generation.isCurrent(token) else { return }
+                simulationSession.confirmGPSRestoration(code == 0)
+            }
         }
     }
 
@@ -1751,7 +1925,7 @@ struct LocationSimulationView: View {
     private func startResendLoop(with coordinate: CLLocationCoordinate2D) {
         simulatedCoordinate = coordinate
         LocationSimulationSession.shared.startResending(at: coordinate) {
-            _ = locationUpdateCode(for: coordinate)
+            locationUpdateCode(for: coordinate)
         }
     }
 
@@ -1787,6 +1961,7 @@ struct LocationSimulationView: View {
         alternativeRoutes = []
         isImportedRoute = false
         setRoutePlan(nil)
+        routeWaypoints = []
         routeStartSelection = nil
         routeEndSelection = nil
         routePlaybackSamples = []
@@ -1822,11 +1997,18 @@ struct LocationSimulationView: View {
         request.requestsAlternateRoutes = true
         request.transportType = travelMode == .walking ? .walking : .automobile
 
+        let waypoints = routeWaypoints
+        let mode = travelMode
         routeLoadTask = Task {
             do {
-                let response = try await MKDirections(request: request).calculate()
+                let plans: [RouteSimulationPlan]
+                if !waypoints.isEmpty {
+                    plans = [try await multiStopPlan(start: routeStart, end: routeEnd, waypoints: waypoints, mode: mode)]
+                } else {
+                let directions = MKDirections(request: request)
+                let response = try await withTaskCancellationHandler { try await directions.calculate() } onCancel: { directions.cancel() }
                 guard !Task.isCancelled else { return }
-                let plans = response.routes.compactMap { route -> RouteSimulationPlan? in
+                plans = response.routes.compactMap { route -> RouteSimulationPlan? in
                     let coordinates = sampledRouteCoordinates(
                         from: route.polyline.coordinateArray,
                         targetDistance: RouteSimulationDefaults.pathSamplingDistance
@@ -1839,6 +2021,8 @@ struct LocationSimulationView: View {
                         name: route.name
                     )
                 }
+                }
+                guard !Task.isCancelled else { return }
                 guard let firstPlan = plans.first else {
                     throw NSError(
                         domain: "RouteSimulation", code: -1,
@@ -1890,6 +2074,7 @@ struct LocationSimulationView: View {
         let useRoadSpeeds = automaticSpeed && travelMode == .driving
         let includeSignals = simulateSignalStops && travelMode == .driving
         let needsDrivingReturn = repeatRoundTrip && travelMode == .driving && !isImportedRoute
+        let needsImportedReturn = repeatRoundTrip && travelMode == .driving && isImportedRoute
         let chosenSpeed: Double? = !automaticSpeed
             ? RoutePlaybackTiming.metersPerSecond(kilometersPerHour: customSpeedKilometersPerHour)
             : travelMode == .walking ? 5 / 3.6 : nil
@@ -1897,7 +2082,12 @@ struct LocationSimulationView: View {
         isPrefetchingRouteSpeeds = true
         routeSpeedPrefetchTask = Task.detached(priority: .utility) {
             do {
-                let reversePlan = needsDrivingReturn ? try await drivingReturnPlan(for: routePlan) : nil
+                let reversePlan: RouteSimulationPlan?
+                if needsDrivingReturn { reversePlan = try await drivingReturnPlan(for: routePlan) }
+                else if needsImportedReturn {
+                    reversePlan = RouteSimulationPlan(displayCoordinates: Array(routePlan.displayCoordinates.reversed()),
+                        distance: routePlan.distance, expectedTravelTime: routePlan.expectedTravelTime, name: routePlan.name)
+                } else { reversePlan = nil }
                 async let outward = preparedSamples(for: routePlan, chosenSpeed: chosenSpeed,
                     useRoadSpeeds: useRoadSpeeds, includeSignals: includeSignals)
                 async let inward = preparedSamples(for: reversePlan, chosenSpeed: chosenSpeed,
@@ -1928,109 +2118,167 @@ struct LocationSimulationView: View {
         routeID: UUID, plan: RouteSimulationPlan, samples: [RoutePlaybackSample],
         returnPlan: RouteSimulationPlan?, returnSamples: [RoutePlaybackSample], repeating: Bool
     ) {
+        guard let outward = streamingPath(samples) else { return }
+        let inward = streamingPath(returnSamples) ?? outward.reversed()
+        let driving = travelMode == .driving
+        let signalStops = simulateSignalStops && driving
+        let maxStop = maximumSignalStop
         routePlaybackTask = Task {
-            guard samples.count > 1 else { return }
-            var lastSuccessfulCoordinate = samples.first?.coordinate
-            var returning = false
+            let session = LocationSimulationSession.shared
             let clock = ContinuousClock()
-
+            var returning = false
             repeat {
-                let hasSeparateReturn = returning && returnPlan != nil
-                let legSamples = hasSeparateReturn ? returnSamples : samples
-                let legPlan = hasSeparateReturn ? returnPlan! : plan
+                let path = returning ? inward : outward
+                let legPlan = returning ? (returnPlan ?? plan) : plan
+                // Hold the endpoint while Apple calculates the next ETA.
+                let trafficHold = Task {
+                    while !Task.isCancelled && session.isCurrentRoute(routeID) {
+                        do { try await Task.sleep(for: .seconds(4)) } catch { return }
+                        guard !Task.isCancelled, session.isCurrentRoute(routeID),
+                              session.connectionState != .disconnected,
+                              let coordinate = session.coordinate else { return }
+                        let code = await sendLocationUpdate(for: coordinate)
+                        guard !Task.isCancelled, session.isCurrentRoute(routeID) else { return }
+                        if code == 0 { session.recordSuccessfulUpdate(coordinate) }
+                        else { session.recordFailure(locationSimulationErrorMessage(for: code)); return }
+                    }
+                }
                 await updateTrafficEstimate(plan: legPlan, routeID: routeID)
-                guard !Task.isCancelled,
-                      LocationSimulationSession.shared.isCurrentRoute(routeID) else { return }
+                trafficHold.cancel()
+                guard !Task.isCancelled, session.isCurrentRoute(routeID) else { return }
                 let slowdown = trafficDelayMultiplier
-                var origin = clock.now
-                var deadline = 0.0
-                let delays = legSamples.map(\.delayFromPrevious)
-                for step in RoutePlaybackTiming.steps(delays: delays, returning: returning && !hasSeparateReturn) {
-                    let elapsed = origin.duration(to: clock.now).timeInterval
-                    deadline = RoutePlaybackTiming.nextDeadline(
-                        previous: deadline, interval: step.delay * slowdown, elapsed: elapsed
-                    )
-                    do {
-                        try await clock.sleep(until: origin.advanced(by: .seconds(deadline)))
-                    } catch { return }
-                    guard !Task.isCancelled,
-                          LocationSimulationSession.shared.isCurrentRoute(routeID) else { return }
+                let randomStops: [RouteScheduledStop] = signalStops ? path.signalIndices.compactMap { index in
+                    let duration = RouteTrafficBehavior.signalStopDuration(chanceRoll: Double.random(in: 0..<1),
+                        durationRoll: Double.random(in: 0...1), maximum: maxStop)
+                    return duration > 0 ? RouteScheduledStop(distance: path.cumulative[index], duration: duration, title: "Simulated signal stop") : nil
+                } : []
+                let plannedStops = returning && returnPlan == nil
+                    ? RouteStopSchedule.reversed(plan.scheduledStops, length: outward.length) : legPlan.scheduledStops
+                let stops = RouteStopSchedule.ordered(plannedStops, signals: randomStops, length: path.length)
+                var stopIndex = 0
+                var signalPause = 0.0
+                var stopTitle = ""
+                var motion = RouteMotionState()
+                var lastTick = clock.now
+                var lastHoldSend = clock.now
+                var deadline = clock.now
 
-                    let coordinate = legSamples[step.sampleIndex].coordinate
-                    let code = await sendLocationUpdate(for: coordinate)
-                    guard !Task.isCancelled,
-                          LocationSimulationSession.shared.isCurrentRoute(routeID) else { return }
-                    guard code == 0 else {
-                        await MainActor.run {
-                            routePlaybackTask = nil
-                            LocationSimulationSession.shared.clearRoute()
-                            routePlaybackCoordinate = lastSuccessfulCoordinate
-                            if let lastSuccessfulCoordinate { startResendLoop(with: lastSuccessfulCoordinate) }
-                            alertTitle = "Route Simulation Failed"
-                            alertMessage = locationSimulationErrorMessage(for: code)
-                            showAlert = true
+                while motion.distance < path.length || signalPause > 0 {
+                    guard !Task.isCancelled, session.isCurrentRoute(routeID) else { return }
+                    if session.connectionState == .disconnected || session.reconnectRequested {
+                        motion.speed = 0
+                        if session.reconnectRequested, let coordinate = session.coordinate {
+                            _ = await reconnectLocation(at: coordinate, routeID: routeID)
+                        } else {
+                            do { try await Task.sleep(for: .seconds(0.5)) } catch { return }
                         }
-                        return
+                        lastTick = clock.now
+                        deadline = clock.now
+                        lastHoldSend = clock.now
+                        continue
                     }
 
-                    lastSuccessfulCoordinate = coordinate
-                    await MainActor.run {
+                    deadline = max(deadline.advanced(by: .seconds(0.5)), clock.now)
+                    do { try await clock.sleep(until: deadline) } catch { return }
+                    guard !Task.isCancelled, session.isCurrentRoute(routeID) else { return }
+                    let elapsed = min(1, lastTick.duration(to: clock.now).timeInterval)
+                    lastTick = clock.now
+                    if session.isPaused || signalPause > 0 {
+                        motion.speed = 0
+                        signalPause = RouteStopSchedule.remaining(signalPause, elapsed: elapsed, paused: session.isPaused)
+                        playbackStatus = session.isPaused ? "Route paused." : "\(stopTitle) · \(Int(ceil(signalPause))) s remaining"
+                        session.updateStop(title: stopTitle, remaining: signalPause)
+                        if lastHoldSend.duration(to: clock.now).timeInterval >= 4,
+                           let coordinate = session.coordinate {
+                            let code = await sendLocationUpdate(for: coordinate)
+                            guard !Task.isCancelled, session.isCurrentRoute(routeID) else { return }
+                            if code == 0 { session.recordSuccessfulUpdate(coordinate) }
+                            else { session.recordFailure(locationSimulationErrorMessage(for: code)) }
+                            lastHoldSend = clock.now
+                        }
+                    } else {
+                        playbackStatus = nil
+                        session.updateStop(title: "", remaining: 0)
+                        let nextStop = stopIndex < stops.count ? stops[stopIndex].distance : path.length
+                        let next = path.advance(motion, elapsed: elapsed, slowdown: slowdown,
+                            stopAt: nextStop, driving: driving)
+                        let point = path.point(at: next.distance)
+                        let coordinate = CLLocationCoordinate2D(latitude: point.latitude, longitude: point.longitude)
+                        let code = await sendLocationUpdate(for: coordinate)
+                        guard !Task.isCancelled, session.isCurrentRoute(routeID) else { return }
+                        guard code == 0 else {
+                            session.recordFailure(locationSimulationErrorMessage(for: code))
+                            continue
+                        }
+                        motion = next
                         routePlaybackCoordinate = coordinate
-                        LocationSimulationSession.shared.updateCoordinate(coordinate)
-                    }
-                    if simulateSignalStops && travelMode == .driving && legSamples[step.sampleIndex].isTrafficSignal {
-                        let duration = RouteTrafficBehavior.signalStopDuration(
-                            chanceRoll: Double.random(in: 0..<1),
-                            durationRoll: Double.random(in: 0...1),
-                            maximum: maximumSignalStop
-                        )
-                        if duration > 0 {
-                            playbackStatus = "Simulated signal stop."
-                            // Re-send the same coordinate during the pause and check
-                            // cancellation every second so Stop takes effect promptly.
-                            let stopEnd = clock.now.advanced(by: .seconds(duration))
-                            while clock.now < stopEnd {
-                                do { try await clock.sleep(until: min(stopEnd, clock.now.advanced(by: .seconds(1)))) }
-                                catch { return }
-                                guard !Task.isCancelled,
-                                      LocationSimulationSession.shared.isCurrentRoute(routeID) else { return }
-                                let pauseCode = await sendLocationUpdate(for: coordinate)
-                                guard !Task.isCancelled,
-                                      LocationSimulationSession.shared.isCurrentRoute(routeID) else { return }
-                                guard pauseCode == 0 else {
-                                    routePlaybackTask = nil
-                                    playbackStatus = nil
-                                    LocationSimulationSession.shared.clearRoute()
-                                    alertTitle = "Route Simulation Failed"
-                                    alertMessage = locationSimulationErrorMessage(for: pauseCode)
-                                    showAlert = true
-                                    return
-                                }
-                            }
-                            // Resume from the end of the stop, without catching up.
-                            origin = clock.now
-                            deadline = 0
-                            playbackStatus = nil
+                        session.recordSuccessfulUpdate(coordinate)
+                        lastHoldSend = clock.now
+                        if stopIndex < stops.count, motion.distance >= stops[stopIndex].distance {
+                            signalPause = stops[stopIndex].duration
+                            stopTitle = stops[stopIndex].title
+                            session.updateStop(title: stopTitle, remaining: signalPause)
+                            stopIndex += 1
                         }
                     }
+                    let futureStops = stops.dropFirst(stopIndex).reduce(0) { $0 + $1.duration }
+                    session.updateProgress(distance: motion.distance, length: path.length, speed: motion.speed,
+                        eta: path.remainingTime(at: motion.distance, slowdown: slowdown) + futureStops + signalPause,
+                        returning: returning)
                 }
+                if returning { session.completedReturn() }
                 returning.toggle()
-            } while repeating && !Task.isCancelled && LocationSimulationSession.shared.isCurrentRoute(routeID)
+            } while repeating && !Task.isCancelled && session.isCurrentRoute(routeID)
 
-            await MainActor.run {
-                guard !Task.isCancelled, LocationSimulationSession.shared.isCurrentRoute(routeID) else { return }
-                routePlaybackTask = nil
-                LocationSimulationSession.shared.clearRoute()
-                if let lastSuccessfulCoordinate {
-                    routePlaybackCoordinate = lastSuccessfulCoordinate
-                    startResendLoop(with: lastSuccessfulCoordinate)
-                }
+            guard !Task.isCancelled, session.isCurrentRoute(routeID) else { return }
+            routePlaybackTask = nil
+            session.clearRoute()
+            session.updateProgress(distance: 1, length: 1, speed: 0, eta: 0, returning: false)
+            if let coordinate = session.coordinate { startResendLoop(with: coordinate) }
+        }
+        if let task = routePlaybackTask { simulationSession.attachPlaybackTask(task, routeID: routeID) }
+    }
+
+    private func reconnectLocation(at coordinate: CLLocationCoordinate2D, routeID: UUID?) async -> Bool {
+        let generation = simulationSession.commandGeneration
+        let token = generation.current()
+        var lastCode: Int32 = -999
+        for attempt in 0..<3 {
+            guard !Task.isCancelled, generation.isCurrent(token),
+                  routeID.map({ simulationSession.isCurrentRoute($0) }) ?? true else { return false }
+            if attempt > 0 {
+                do { try await Task.sleep(for: .seconds(Double(attempt))) } catch { return false }
+            }
+            guard !Task.isCancelled, generation.isCurrent(token) else { return false }
+            lastCode = await sendLocationUpdate(for: coordinate)
+            guard !Task.isCancelled, generation.isCurrent(token) else { return false }
+            if lastCode == 0 {
+                simulationSession.recordSuccessfulUpdate(coordinate)
+                simulationSession.finishReconnect()
+                if routeID == nil { startResendLoop(with: coordinate) }
+                return true
             }
         }
+        guard generation.isCurrent(token) else { return false }
+        simulationSession.recordFailure("Three connection attempts failed. " + locationSimulationErrorMessage(for: lastCode))
+        return false
+    }
+
+    private func retryConnection() {
+        guard !isStopping, !isBusy, simulationSession.connectionState == .disconnected else { return }
+        simulationSession.requestReconnect()
+        if simulationSession.routeCoordinates != nil { return }
+        guard let coordinate = simulationSession.coordinate ?? self.coordinate else {
+            simulationSession.recordFailure("Select a point before retrying the connection.")
+            return
+        }
+        reconnectTask?.cancel()
+        reconnectTask = Task { _ = await reconnectLocation(at: coordinate, routeID: nil) }
     }
 
     private func updateTrafficEstimate(plan: RouteSimulationPlan, routeID: UUID) async {
         trafficDelayMultiplier = 1
+        trafficEstimateDate = nil
         guard travelMode == .driving, useTrafficEstimate, !isImportedRoute,
               selectedRouteIndex == 0,
               let start = plan.displayCoordinates.first,
@@ -2038,59 +2286,65 @@ struct LocationSimulationView: View {
             trafficStatus = "Traffic estimate unavailable for this route or mode."
             return
         }
-
         playbackStatus = "Updating traffic estimate…"
-        let request = MKDirections.Request()
-        request.source = MKMapItem(placemark: MKPlacemark(coordinate: start))
-        request.destination = MKMapItem(placemark: MKPlacemark(coordinate: end))
-        request.transportType = .automobile
-        request.departureDate = Date()
-        let directions = MKDirections(request: request)
-        trafficRequest = directions
         defer {
             if LocationSimulationSession.shared.isCurrentRoute(routeID) {
                 trafficRequest = nil
                 playbackStatus = nil
             }
         }
-        // Do not leave the simulation waiting indefinitely for an ETA response.
-        let timeout = Task {
-            do { try await Task.sleep(for: .seconds(15)) }
-            catch { return }
-            directions.cancel()
-        }
-        defer { timeout.cancel() }
-        do {
-            let eta = try await directions.calculateETA()
+        let legs = plan.trafficLegs.isEmpty
+            ? [RouteTrafficLeg(start: start, end: end, distance: plan.distance, idealTime: plan.expectedTravelTime)]
+            : plan.trafficLegs
+        var totalTraffic = 0.0, totalIdeal = 0.0
+        for (index, leg) in legs.enumerated() {
             guard !Task.isCancelled, LocationSimulationSession.shared.isCurrentRoute(routeID) else { return }
-            // ETA may pick a different road. Reject estimates with materially
-            // different distances rather than applying an unrelated detour time.
-            guard plan.distance > 0,
-                  abs(eta.distance - plan.distance) / plan.distance <= 0.05 else {
-                trafficStatus = "Traffic estimate unavailable for this path; keeping selected speed."
+            playbackStatus = "Updating traffic: leg \(index + 1)/\(legs.count)…"
+            let request = MKDirections.Request()
+            request.source = MKMapItem(placemark: MKPlacemark(coordinate: leg.start))
+            request.destination = MKMapItem(placemark: MKPlacemark(coordinate: leg.end))
+            request.transportType = .automobile
+            request.departureDate = Date()
+            let directions = MKDirections(request: request)
+            trafficRequest = directions
+            let timeout = Task {
+                do { try await Task.sleep(for: .seconds(10)) } catch { return }
+                directions.cancel()
+            }
+            do {
+                let eta = try await withTaskCancellationHandler { try await directions.calculateETA() } onCancel: { directions.cancel() }
+                timeout.cancel()
+                guard !Task.isCancelled, LocationSimulationSession.shared.isCurrentRoute(routeID) else { return }
+                guard leg.distance > 0, abs(eta.distance - leg.distance) / leg.distance <= 0.05 else {
+                    trafficStatus = "Traffic estimate unavailable for this path; keeping selected speed."
+                    return
+                }
+                totalTraffic += eta.expectedTravelTime
+                totalIdeal += leg.idealTime
+            } catch {
+                timeout.cancel()
+                guard !Task.isCancelled, LocationSimulationSession.shared.isCurrentRoute(routeID) else { return }
+                trafficStatus = "Traffic estimate unavailable; keeping selected speed."
                 return
             }
-            trafficDelayMultiplier = RouteTrafficBehavior.slowdown(
-                idealTime: plan.expectedTravelTime,
-                trafficTime: eta.expectedTravelTime
-            )
-            trafficStatus = String(format: "Route-wide traffic estimate: %.1f× travel time.", trafficDelayMultiplier)
-        } catch {
-            guard !Task.isCancelled, LocationSimulationSession.shared.isCurrentRoute(routeID) else { return }
-            trafficStatus = "Traffic estimate unavailable; keeping selected speed."
         }
+        trafficDelayMultiplier = RouteTrafficBehavior.slowdown(idealTime: totalIdeal, trafficTime: totalTraffic)
+        trafficEstimateDate = Date()
+        trafficStatus = String(format: "Approximate route-wide traffic: %.1f× travel time.", trafficDelayMultiplier)
     }
 
     private func sendLocationUpdate(for coordinate: CLLocationCoordinate2D) async -> Int32 {
         let generation = LocationSimulationSession.shared.commandGeneration
         let token = generation.current()
+        let ip = deviceIP
+        let pairingPath = pairingFilePath
         return await withCheckedContinuation { continuation in
             LocationSimulationCommandQueue.shared.async {
                 guard generation.isCurrent(token) else {
                     continuation.resume(returning: Int32(-999))
                     return
                 }
-                continuation.resume(returning: locationUpdateCode(for: coordinate))
+                continuation.resume(returning: simulate_location(ip, coordinate.latitude, coordinate.longitude, pairingPath))
             }
         }
     }
@@ -2124,9 +2378,12 @@ private func searchLocations(_ request: MKLocalSearch.Request) async throws -> [
 private struct RouteSearchSheet: View {
     @Environment(\.dismiss) private var dismiss
     let searchRegion: MKCoordinateRegion?
-    let onApply: (RouteSearchSelection, RouteSearchSelection) -> Void
+    let onApply: (RouteSearchSelection, RouteSearchSelection, [RouteWaypoint]) -> Void
     @StateObject private var startCompleter = LocationSearchCompleter()
     @StateObject private var endCompleter = LocationSearchCompleter()
+    @State private var waypoints: [RouteWaypoint]
+    @State private var showStopEditor = false
+    @State private var editingStopID: UUID?
     @State private var startQuery: String
     @State private var endQuery: String
     @State private var startSelection: RouteSearchSelection?
@@ -2141,10 +2398,11 @@ private struct RouteSearchSheet: View {
     @FocusState private var focusedField: RouteSearchField?
 
     init(initialStart: RouteSearchSelection?, initialEnd: RouteSearchSelection?,
-         searchRegion: MKCoordinateRegion?,
-         onApply: @escaping (RouteSearchSelection, RouteSearchSelection) -> Void) {
+         initialWaypoints: [RouteWaypoint], searchRegion: MKCoordinateRegion?,
+         onApply: @escaping (RouteSearchSelection, RouteSearchSelection, [RouteWaypoint]) -> Void) {
         self.searchRegion = searchRegion
         self.onApply = onApply
+        _waypoints = State(initialValue: Array(initialWaypoints.prefix(RouteStopSchedule.maximumWaypoints)))
         _startQuery = State(initialValue: initialStart?.title ?? "")
         _endQuery = State(initialValue: initialEnd?.title ?? "")
         _startSelection = State(initialValue: initialStart)
@@ -2164,6 +2422,7 @@ private struct RouteSearchSheet: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     routeField(title: "Start", text: $startQuery, selection: startSelection, field: .start)
+                    waypointControls
                     routeField(title: "End", text: $endQuery, selection: endSelection, field: .end)
                     Text("Include city and country for better matches. You can also enter latitude, longitude or choose either endpoint on the map.")
                         .font(.footnote).foregroundStyle(.secondary)
@@ -2211,7 +2470,7 @@ private struct RouteSearchSheet: View {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Use Route") {
                         guard let startSelection, let endSelection else { return }
-                        onApply(startSelection, endSelection)
+                        onApply(startSelection, endSelection, waypoints)
                         dismiss()
                     }
                     .disabled(startSelection == nil || endSelection == nil || isResolvingSelection)
@@ -2219,6 +2478,12 @@ private struct RouteSearchSheet: View {
             }
         }
         .presentationDetents([.large])
+        .sheet(isPresented: $showStopEditor) {
+            RouteStopEditor(initial: waypoints.first { $0.id == editingStopID }, region: searchRegion) { stop in
+                if let index = waypoints.firstIndex(where: { $0.id == stop.id }) { waypoints[index] = stop }
+                else if waypoints.count < RouteStopSchedule.maximumWaypoints { waypoints.append(stop) }
+            }
+        }
         .sheet(item: $mapPickerField) { field in
             RouteEndpointPicker(
                 title: field == .start ? "Choose Start" : "Choose Destination",
@@ -2236,6 +2501,37 @@ private struct RouteSearchSheet: View {
             else if endSelection == nil { focusedField = .end }
         }
         .onDisappear { invalidateSearch() }
+    }
+
+    private var waypointControls: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Intermediate stops (\(waypoints.count)/5)").font(.headline)
+            Text("Visited in this order. Repeat visits them in reverse order on the return, with the same waiting times.")
+                .font(.caption).foregroundStyle(.secondary)
+            ForEach(Array(waypoints.enumerated()), id: \.element.id) { index, stop in
+                VStack(alignment: .leading, spacing: 6) {
+                    Button {
+                        invalidateSearch(); focusedField = nil
+                        editingStopID = stop.id; showStopEditor = true
+                    } label: {
+                        VStack(alignment: .leading) {
+                            Text("\(index + 1). " + stop.selection.title).lineLimit(2)
+                            Text("Wait \(Int(stop.duration)) seconds").font(.caption)
+                        }
+                    }
+                    HStack {
+                        Button("Move up") { waypoints.swapAt(index, index - 1) }.disabled(index == 0)
+                        Button("Move down") { waypoints.swapAt(index, index + 1) }.disabled(index == waypoints.count - 1)
+                        Button("Remove", role: .destructive) { waypoints.removeAll { $0.id == stop.id } }
+                    }.font(.caption).buttonStyle(.bordered)
+                }
+                Divider()
+            }
+            Button("Add stop") {
+                invalidateSearch(); focusedField = nil
+                editingStopID = nil; showStopEditor = true
+            }.buttonStyle(.bordered).disabled(waypoints.count >= RouteStopSchedule.maximumWaypoints)
+        }
     }
 
     private func routeField(title: String, text: Binding<String>, selection: RouteSearchSelection?,
@@ -2347,6 +2643,170 @@ private struct RouteSearchSheet: View {
                 isResolvingSelection = false
                 errorMessage = "Search failed. You can choose a point on the map or use coordinates. " + error.localizedDescription
             }
+        }
+    }
+}
+
+private struct RouteStopEditor: View {
+    @Environment(\.dismiss) private var dismiss
+    let region: MKCoordinateRegion?
+    let onSave: (RouteWaypoint) -> Void
+    let stopID: UUID
+    @State private var query: String
+    @State private var selection: RouteSearchSelection?
+    @State private var seconds: String
+    @State private var showMap = false
+    @State private var items: [MKMapItem] = []
+    @State private var searchTask: Task<Void, Never>?
+    @State private var searchID = UUID()
+    @State private var isSearching = false
+    @State private var error: String?
+
+    init(initial: RouteWaypoint?, region: MKCoordinateRegion?, onSave: @escaping (RouteWaypoint) -> Void) {
+        self.region = region
+        self.onSave = onSave
+        stopID = initial?.id ?? UUID()
+        _query = State(initialValue: initial?.selection.title ?? "")
+        _selection = State(initialValue: initial?.selection)
+        _seconds = State(initialValue: String(Int(initial?.duration ?? 60)))
+    }
+    private var duration: Double? {
+        guard let value = Double(seconds), RouteStopSchedule.validDuration(value) else { return nil }
+        return value
+    }
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Stop location") {
+                    TextField("Address, city or latitude, longitude", text: $query)
+                        .autocorrectionDisabled().submitLabel(.search)
+                        .onSubmit { search() }
+                        .onChange(of: query) { _, value in
+                            guard value != selection?.title else { return }
+                            selection = nil
+                            invalidate()
+                        }
+                    Button("Search address") { search() }.disabled(query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    Button("Choose on map") { invalidate(); showMap = true }
+                    if let selection {
+                        Text(String(format: "%.6f, %.6f", selection.coordinate.latitude, selection.coordinate.longitude))
+                            .font(.caption.monospaced())
+                    }
+                    if isSearching { ProgressView("Searching…") }
+                    if let error { Text(error).foregroundStyle(.red).font(.footnote) }
+                    ForEach(items.indices, id: \.self) { index in
+                        let item = items[index]
+                        Button {
+                            apply(RouteSearchSelection(title: item.placemark.title ?? item.name ?? "Stop",
+                                coordinate: item.placemark.coordinate))
+                        } label: {
+                            VStack(alignment: .leading) {
+                                Text(item.name ?? "Location")
+                                Text(item.placemark.title ?? "").font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+                Section("Waiting time") {
+                    TextField("Seconds", text: $seconds).keyboardType(.numberPad)
+                    HStack {
+                        Button("30 s") { seconds = "30" }
+                        Button("1 min") { seconds = "60" }
+                        Button("5 min") { seconds = "300" }
+                    }.buttonStyle(.bordered)
+                    Text("Enter 0 to 86,400 seconds. Zero passes through without waiting. Pause freezes the countdown; Stop ends the simulation.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                    if duration == nil { Text("Enter a valid waiting time.").foregroundStyle(.red) }
+                }
+            }
+            .navigationTitle("Scheduled stop")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        guard let selection, let duration else { return }
+                        onSave(RouteWaypoint(id: stopID, selection: selection, duration: duration))
+                        dismiss()
+                    }.disabled(selection == nil || duration == nil || isSearching)
+                }
+            }
+        }
+        .sheet(isPresented: $showMap) {
+            RouteEndpointPicker(title: "Choose stop", coordinate: selection?.coordinate, region: region) { coordinate in
+                apply(RouteSearchSelection(title: String(format: "%.6f, %.6f", coordinate.latitude, coordinate.longitude),
+                    coordinate: coordinate))
+            }
+        }
+        .onDisappear { invalidate() }
+    }
+    private func invalidate() {
+        searchTask?.cancel()
+        searchID = UUID()
+        items = []
+        isSearching = false
+    }
+    private func apply(_ value: RouteSearchSelection) {
+        invalidate()
+        selection = value
+        query = value.title
+        error = nil
+    }
+    private func search() {
+        let text = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        invalidate()
+        if let pair = CoordinateText.parse(text) {
+            apply(RouteSearchSelection(title: text, coordinate: CLLocationCoordinate2D(latitude: pair.latitude, longitude: pair.longitude)))
+            return
+        }
+        let id = searchID
+        let request = MKLocalSearch.Request()
+        request.naturalLanguageQuery = text
+        request.resultTypes = [.address, .pointOfInterest]
+        if let region { request.region = region }
+        isSearching = true
+        error = nil
+        searchTask = Task {
+            do {
+                let found = try await searchLocations(request)
+                guard !Task.isCancelled, searchID == id else { return }
+                items = found
+                isSearching = false
+                if found.isEmpty { error = "No matches. Include city and country, use coordinates or choose on map." }
+            } catch {
+                guard !Task.isCancelled, searchID == id else { return }
+                isSearching = false
+                self.error = "Search failed. Use coordinates or choose on map. " + error.localizedDescription
+            }
+        }
+    }
+}
+
+private struct LocationSearchResultsSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    let items: [MKMapItem]
+    let onSelect: (MKMapItem) -> Void
+
+    var body: some View {
+        NavigationStack {
+            List(items.indices, id: \.self) { index in
+                let item = items[index]
+                Button {
+                    onSelect(item)
+                    dismiss()
+                } label: {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(item.name ?? "Location").foregroundStyle(.primary)
+                        Text(item.placemark.title ?? "").font(.caption).foregroundStyle(.secondary)
+                        Text(String(format: "%.5f, %.5f", item.placemark.coordinate.latitude,
+                            item.placemark.coordinate.longitude)).font(.caption2.monospaced()).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .navigationTitle("Choose an address")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } } }
         }
     }
 }
