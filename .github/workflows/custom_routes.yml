@@ -1,8 +1,6 @@
 name: Build custom routes IPA
 
 on:
-  push:
-    branches: [route-speed-repeat]
   workflow_dispatch:
 
 permissions:
@@ -20,9 +18,9 @@ jobs:
       - uses: maxim-lobanov/setup-xcode@v1
         with:
           xcode-version: latest-stable
-      - name: Check speed conversion and continuous round trips
+      - name: Check streaming routes and session recovery
         run: |
-          swiftc StikDebug/Services/RoutePlaybackOptions.swift RoutePlaybackTimingChecks.swift -o /tmp/route-checks
+          swiftc -D ROUTE_SESSION_CHECKS StikDebug/Services/RoutePlaybackOptions.swift StikDebug/Services/LocationSimulationSession.swift RoutePlaybackTimingChecks.swift -o /tmp/route-checks
           /tmp/route-checks
       - name: Compile unsigned iPhone app
         run: |
@@ -41,6 +39,9 @@ jobs:
             IPHONEOS_DEPLOYMENT_TARGET=17.4
       - name: Package IPA
         run: |
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${GITHUB_RUN_NUMBER}" build/StikDebug.xcarchive/Products/Applications/StikDebug.app/Info.plist
+          /usr/libexec/PlistBuddy -c "Add :StikRoutesRevision string ${GITHUB_SHA}" build/StikDebug.xcarchive/Products/Applications/StikDebug.app/Info.plist
+          /usr/libexec/PlistBuddy -c "Add :StikRoutesBuiltAt string $(date -u +%Y-%m-%dT%H:%M:%SZ)" build/StikDebug.xcarchive/Products/Applications/StikDebug.app/Info.plist
           mkdir -p Payload
           cp -R build/StikDebug.xcarchive/Products/Applications/StikDebug.app Payload/
           zip -r StikDebug-CustomRoutes.ipa Payload
