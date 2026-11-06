@@ -1,6 +1,8 @@
 name: Build custom routes IPA
 
 on:
+  push:
+    branches: [route-speed-repeat]
   workflow_dispatch:
 
 permissions:
