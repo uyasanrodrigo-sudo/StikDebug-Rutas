@@ -33,6 +33,12 @@ final class RemotePairingPortResolver: NSObject, NetServiceBrowserDelegate, NetS
     private let browser = NetServiceBrowser()
     private var services: [NetService] = []
     private var resolvedPort: UInt16?
+    private let targetIPAddress: String
+
+    init(targetIPAddress: String = DeviceConnectionContext.targetIPAddress) {
+        self.targetIPAddress = targetIPAddress
+        super.init()
+    }
 
     /// Resolve on a worker thread with an active run loop. An explicit Settings
     /// override takes precedence when multicast DNS cannot see the local service.
@@ -87,7 +93,22 @@ final class RemotePairingPortResolver: NSObject, NetServiceBrowserDelegate, NetS
     }
 
     func netServiceDidResolveAddress(_ sender: NetService) {
-        if (1...65535).contains(sender.port), resolvedPort == nil {
+        // Other Apple devices may advertise this service on the same Wi-Fi.
+        // Only borrow a port advertised for the configured endpoint. Otherwise
+        // use the normal fallback, whose pairing handshake authenticates it.
+        let matchesTarget = (sender.addresses ?? []).contains { data in
+            data.withUnsafeBytes { bytes -> Bool in
+                guard bytes.count >= MemoryLayout<sockaddr_in>.size,
+                      let raw = bytes.baseAddress else { return false }
+                let address = raw.loadUnaligned(as: sockaddr_in.self)
+                guard address.sin_family == sa_family_t(AF_INET) else { return false }
+                var ip = address.sin_addr
+                var buffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+                guard inet_ntop(AF_INET, &ip, &buffer, socklen_t(buffer.count)) != nil else { return false }
+                return String(cString: buffer) == targetIPAddress
+            }
+        }
+        if matchesTarget, (1...65535).contains(sender.port), resolvedPort == nil {
             resolvedPort = UInt16(sender.port)
         }
     }

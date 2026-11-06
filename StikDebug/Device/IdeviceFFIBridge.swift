@@ -784,7 +784,15 @@ func locationSimulationErrorMessage(for code: Int32) -> String {
     case 2:
         explanation = "The pairing file could not be read. Import a valid pairing file for this iPhone."
     case 3:
-        explanation = "The local VPN tunnel could not be created. This happens before accessing the location service; it does not establish that the DDI is missing. Check LocalDevVPN. On cellular-only connections, prepare the session on Wi-Fi first; some iOS versions require briefly toggling Airplane Mode with the VPN enabled."
+        explanation = "The local VPN tunnel could not be created. This does not establish that the DDI is missing. " + MobileDataConnectionGuide.instructions + " " + MobileDataConnectionGuide.limitation
+    case 9:
+        explanation = "The tunnel was created but the developer remote service did not open. Reconnect LocalDevVPN and check the device connection."
+    case 10:
+        explanation = "The developer location service could not open. Check the DDI preparation status and device compatibility."
+    case 11:
+        explanation = "The location update failed. Playback is paused until a successful reconnection."
+    case 12:
+        explanation = "Local playback has stopped, but restoring the device GPS could not be confirmed. Reconnect the VPN and retry Stop."
     default:
         explanation = "The developer location service could not complete the request. Check the VPN connection and prepare the DDI on Wi-Fi after restarting the iPhone."
     }
@@ -942,6 +950,8 @@ private func startLocationSimulationService(
 
 func clear_simulated_location() -> Int32 {
     guard let locationSimulation = LocationSimulationState.locationSimulation else {
+        LocationSimulationFailure.record(code: LocationSimulationStatus.locationClear, error: nil,
+            fallback: "No connected location service is available to confirm GPS restoration")
         return LocationSimulationStatus.locationClear
     }
 
@@ -949,7 +959,8 @@ func clear_simulated_location() -> Int32 {
     LocationSimulationState.cleanup()
 
     if let ffiError {
-        idevice_error_free(ffiError)
+        LocationSimulationFailure.record(code: LocationSimulationStatus.locationClear,
+            error: ffiError, fallback: "Could not confirm GPS restoration")
         return LocationSimulationStatus.locationClear
     }
 
