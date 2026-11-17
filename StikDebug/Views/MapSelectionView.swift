@@ -1129,94 +1129,105 @@ struct LocationSimulationView: View {
         }
     }
 
-    var body: some View {
-        ZStack(alignment: .bottom) {
-            MapReader { proxy in
-                Map(position: $position) {
-                    if hasRouteContext {
-                        if let routePolyline {
-                            MapPolyline(routePolyline)
-                                .stroke(.blue.opacity(0.8), lineWidth: 5)
-                        }
-                        if let returnRoutePlan,
-                           let returnLine = makeRoutePolyline(for: returnRoutePlan.displayCoordinates) {
-                            MapPolyline(returnLine)
-                                .stroke(.orange.opacity(0.7), lineWidth: 4)
-                        }
-                        if let routeStartCoordinate {
-                            Marker("Start", coordinate: routeStartCoordinate)
-                                .tint(.green)
-                        }
-                        ForEach(Array(routeWaypoints.enumerated()), id: \.element.id) { index, stop in
-                            Marker("Stop \(index + 1)", coordinate: stop.selection.coordinate).tint(.purple)
-                        }
-                        if let routeEndCoordinate {
-                            Marker("End", coordinate: routeEndCoordinate)
-                                .tint(.red)
-                        }
-                        if let displayedRouteCoordinate {
-                            Marker("Current", coordinate: displayedRouteCoordinate)
-                                .tint(.blue)
-                        }
-                    } else if let coordinate {
-                        Marker("Pin", coordinate: coordinate)
-                            .tint(.red)
-                        if simulationSession.isActive, let current = simulationSession.coordinate {
-                            Marker("Current", coordinate: current).tint(.blue)
-                        }
-                    }
-                }
-                .onMapCameraChange(frequency: .onEnd) { context in
-                    searchRegion = context.region
-                    searchCompleter.region = context.region
-                }
-                .mapStyle(useSatelliteMap ? .hybrid(elevation: .realistic) : .standard(elevation: .realistic))
-                .onTapGesture { point in
-                    if let loc = proxy.convert(point, from: .local) {
-                        applySelection(loc)
-                    }
-                }
-                .mapControls {
-                    MapCompass()
+    // Keep opaque view expressions small enough for the SwiftUI type checker.
+    @MapContentBuilder
+    private var simulationMapContent: some MapContent {
+        if hasRouteContext {
+            if let routePolyline {
+                MapPolyline(routePolyline)
+                    .stroke(.blue.opacity(0.8), lineWidth: 5)
+            }
+            if let returnRoutePlan,
+               let returnLine = makeRoutePolyline(for: returnRoutePlan.displayCoordinates) {
+                MapPolyline(returnLine)
+                    .stroke(.orange.opacity(0.7), lineWidth: 4)
+            }
+            if let routeStartCoordinate {
+                Marker("Start", coordinate: routeStartCoordinate)
+                    .tint(.green)
+            }
+            ForEach(Array(routeWaypoints.enumerated()), id: \.element.id) { index, stop in
+                Marker("Stop \(index + 1)", coordinate: stop.selection.coordinate).tint(.purple)
+            }
+            if let routeEndCoordinate {
+                Marker("End", coordinate: routeEndCoordinate)
+                    .tint(.red)
+            }
+            if let displayedRouteCoordinate {
+                Marker("Current", coordinate: displayedRouteCoordinate)
+                    .tint(.blue)
+            }
+        } else if let coordinate {
+            Marker("Pin", coordinate: coordinate)
+                .tint(.red)
+            if simulationSession.isActive, let current = simulationSession.coordinate {
+                Marker("Current", coordinate: current).tint(.blue)
+            }
+        }
+    }
+
+    private var mapCanvas: some View {
+        MapReader { proxy in
+            Map(position: $position) { simulationMapContent }
+            .onMapCameraChange(frequency: .onEnd) { context in
+                searchRegion = context.region
+                searchCompleter.region = context.region
+            }
+            .mapStyle(useSatelliteMap ? .hybrid(elevation: .realistic) : .standard(elevation: .realistic))
+            .onTapGesture { point in
+                if let loc = proxy.convert(point, from: .local) {
+                    applySelection(loc)
                 }
             }
-                .ignoresSafeArea()
-                .onChange(of: coordinate.map(CoordinateSnapshot.init)) { _, new in
-                    if let new {
-                        position = .region(
-                            MKCoordinateRegion(
-                                center: new.coordinate,
-                                latitudinalMeters: 1000,
-                                longitudinalMeters: 1000
-                            )
+            .mapControls {
+                MapCompass()
+            }
+        }
+            .ignoresSafeArea()
+            .onChange(of: coordinate.map(CoordinateSnapshot.init)) { _, new in
+                if let new {
+                    position = .region(
+                        MKCoordinateRegion(
+                            center: new.coordinate,
+                            latitudinalMeters: 1000,
+                            longitudinalMeters: 1000
                         )
-                    }
+                    )
                 }
-
-            VStack(spacing: 0) {
-                if !searchCompleter.results.isEmpty {
-                    searchResultsList
-                }
-
-                Spacer()
-
-                VStack(spacing: 12) {
-                    connectionStatusControls
-                    if isImportingCoordinates {
-                        ProgressView("Importing coordinates…")
-                            .font(.footnote)
-                    }
-
-                    if hasRouteContext {
-                        routeControls
-                    } else {
-                        pinControls
-                    }
-                }
-                .padding(.bottom, 24)
-                .padding(.horizontal, 16)
-                .padding(.horizontal, 16)
             }
+    }
+
+    private var mapOverlay: some View {
+        VStack(spacing: 0) {
+            if !searchCompleter.results.isEmpty {
+                searchResultsList
+            }
+
+            Spacer()
+
+            VStack(spacing: 12) {
+                connectionStatusControls
+                if isImportingCoordinates {
+                    ProgressView("Importing coordinates…")
+                        .font(.footnote)
+                }
+
+                if hasRouteContext {
+                    routeControls
+                } else {
+                    pinControls
+                }
+            }
+            .padding(.bottom, 24)
+            .padding(.horizontal, 16)
+            .padding(.horizontal, 16)
+        }
+    }
+
+    private var mapScaffold: some View {
+        ZStack(alignment: .bottom) {
+            mapCanvas
+            mapOverlay
         }
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
@@ -1264,6 +1275,32 @@ struct LocationSimulationView: View {
                     }
             }
         }
+    }
+
+    private var routeSearchContent: some View {
+        RouteSearchSheet(
+            initialStart: isRouteRunning ? simulationSession.coordinate.map {
+                RouteSearchSelection(title: "Current simulated position", coordinate: $0)
+            } : routeStartSelection,
+            initialEnd: routeEndSelection,
+            initialWaypoints: isRouteRunning ? [] : routeWaypoints,
+            locksStart: isRouteRunning,
+            searchRegion: searchRegion
+        ) { startSelection, endSelection, waypoints in
+            if isRouteRunning {
+                replaceRunningRoute(destination: endSelection, waypoints: waypoints)
+                return
+            }
+            routeStartSelection = startSelection
+            routeEndSelection = endSelection
+            routeWaypoints = waypoints
+            isImportedRoute = false
+            refreshRoute()
+        }
+    }
+
+    private var presentedMap: some View {
+        mapScaffold
         .alert(alertTitle, isPresented: $showAlert) {
             Button("OK", role: .cancel) { }
         } message: {
@@ -1285,27 +1322,7 @@ struct LocationSimulationView: View {
                 saveBookmarks()
             }
         }
-        .sheet(isPresented: $showRouteSearch) {
-            RouteSearchSheet(
-                initialStart: isRouteRunning ? simulationSession.coordinate.map {
-                    RouteSearchSelection(title: "Current simulated position", coordinate: $0)
-                } : routeStartSelection,
-                initialEnd: routeEndSelection,
-                initialWaypoints: isRouteRunning ? [] : routeWaypoints,
-                locksStart: isRouteRunning,
-                searchRegion: searchRegion
-            ) { startSelection, endSelection, waypoints in
-                if isRouteRunning {
-                    replaceRunningRoute(destination: endSelection, waypoints: waypoints)
-                    return
-                }
-                routeStartSelection = startSelection
-                routeEndSelection = endSelection
-                routeWaypoints = waypoints
-                isImportedRoute = false
-                refreshRoute()
-            }
-        }
+        .sheet(isPresented: $showRouteSearch) { routeSearchContent }
         .sheet(isPresented: $showResolvedSearch) {
             LocationSearchResultsSheet(items: resolvedSearchItems) { item in
                 applySelection(item.placemark.coordinate)
@@ -1315,6 +1332,10 @@ struct LocationSimulationView: View {
         .sheet(isPresented: $showRouteOptions) {
             routeOptionsSheet
         }
+    }
+
+    private var configuredMap: some View {
+        presentedMap
         .onChange(of: travelMode) { _, _ in
             if isImportedRoute {
                 prepareRoutePlayback()
@@ -1350,6 +1371,10 @@ struct LocationSimulationView: View {
         ) { result in
             importCoordinates(result)
         }
+    }
+
+    var body: some View {
+        configuredMap
         .onAppear {
             loadBookmarks()
             if let routeCoordinates = simulationSession.routeCoordinates {
