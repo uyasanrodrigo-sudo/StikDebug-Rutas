@@ -112,6 +112,60 @@ enum RouteTrafficBehavior {
     }
 }
 
+enum RouteTrafficMode: String, CaseIterable, Identifiable {
+    case automatic = "Automatic"
+    case free = "Free flowing"
+    case slow = "Slow"
+    case jam = "Traffic jam"
+    var id: String { rawValue }
+    var manualSlowdown: Double? {
+        switch self {
+        case .automatic: return nil
+        case .free: return 1
+        case .slow: return 2
+        case .jam: return 4
+        }
+    }
+}
+
+struct RouteTrafficSection {
+    let start: Double
+    let end: Double
+    let slowdown: Double
+
+    static func slowdown(at distance: Double, sections: [RouteTrafficSection]) -> Double {
+        sections.first { distance >= $0.start && distance < $0.end }?.slowdown ?? 1
+    }
+}
+
+// Local metre offsets keep the walk inside a disk. Supplied random inputs
+// make the boundary, pauses and speed independently verifiable.
+struct StaticWanderMotion {
+    private(set) var east = 0.0
+    private(set) var north = 0.0
+    private var targetEast = 0.0
+    private var targetNorth = 0.0
+    private var pause = 0.0
+
+    mutating func advance(elapsed: Double, radius: Double, angleRoll: Double, radiusRoll: Double, pauseRoll: Double) {
+        let dt = min(4, max(0, elapsed.isFinite ? elapsed : 0))
+        let radius = min(100, max(10, radius.isFinite ? radius : 10)) - 3
+        if pause > 0 { pause = max(0, pause - dt); return }
+        let distance = hypot(targetEast - east, targetNorth - north)
+        if distance < 0.1 {
+            let angle = min(1, max(0, angleRoll)) * 2 * Double.pi
+            let length = sqrt(min(1, max(0, radiusRoll))) * radius
+            targetEast = cos(angle) * length
+            targetNorth = sin(angle) * length
+            pause = 2 + min(1, max(0, pauseRoll)) * 10
+            return
+        }
+        let fraction = min(1, 0.7 * dt / distance)
+        east += (targetEast - east) * fraction
+        north += (targetNorth - north) * fraction
+    }
+}
+
 enum MobileDataConnectionGuide {
     static let instructions = "Connect LocalDevVPN with Mobile Data on. Temporarily turn off only Mobile Data, keeping the VPN active. Connect or simulate in StikDebug, then turn Mobile Data back on after the connection succeeds."
     static let limitation = "This sequence worked on the tested iPhone. It may need repeating after losing the session. Do not use Airplane Mode for this sequence."
@@ -230,6 +284,16 @@ struct RouteStreamPath: Sendable {
         return ((cumulative[index + 1] - max(0, distance)) / speeds[index] + remainingTimes[index + 1]) * max(1, slowdown)
     }
 
+    func remainingTime(at distance: Double, sections: [RouteTrafficSection]) -> Double {
+        let base = remainingTime(at: distance, slowdown: 1)
+        return base + sections.reduce(0) { result, section in
+            let start = max(distance, section.start), end = min(length, section.end)
+            guard start < end else { return result }
+            let time = remainingTime(at: start, slowdown: 1) - remainingTime(at: end, slowdown: 1)
+            return result + time * (max(1, section.slowdown) - 1)
+        }
+    }
+
     func advance(_ state: RouteMotionState, elapsed: Double, slowdown: Double, stopAt: Double, driving: Bool) -> RouteMotionState {
         let dt = min(1, max(0, elapsed.isFinite ? elapsed : 0))
         let stop = min(length, max(state.distance, stopAt))
@@ -279,11 +343,22 @@ struct RouteScheduledStop: Sendable, Equatable {
     var distance: Double
     var duration: Double
     var title: String
+    var maximumDuration: Double? = nil
+
+    func sampled(roll: Double) -> RouteScheduledStop {
+        let upper = maximumDuration ?? duration
+        let wait = RouteStopSchedule.validRange(minimum: duration, maximum: upper)
+            ? duration + min(1, max(0, roll)) * (upper - duration) : duration
+        return RouteScheduledStop(distance: distance, duration: wait, title: title)
+    }
 }
 
 enum RouteStopSchedule {
     static let maximumWaypoints = 5
     static func validDuration(_ value: Double) -> Bool { value.isFinite && (0...86_400).contains(value) }
+    static func validRange(minimum: Double, maximum: Double) -> Bool {
+        validDuration(minimum) && validDuration(maximum) && minimum <= maximum
+    }
     static func ordered(_ planned: [RouteScheduledStop], signals: [RouteScheduledStop], length: Double) -> [RouteScheduledStop] {
         let sorted = (planned + signals).filter {
             $0.distance.isFinite && $0.distance >= 0 && $0.distance <= length && validDuration($0.duration) && $0.duration > 0
@@ -299,7 +374,8 @@ enum RouteStopSchedule {
         return result
     }
     static func reversed(_ stops: [RouteScheduledStop], length: Double) -> [RouteScheduledStop] {
-        stops.reversed().map { RouteScheduledStop(distance: max(0, length - $0.distance), duration: $0.duration, title: $0.title) }
+        stops.reversed().map { RouteScheduledStop(distance: max(0, length - $0.distance), duration: $0.duration,
+            title: $0.title, maximumDuration: $0.maximumDuration) }
     }
     static func remaining(_ value: Double, elapsed: Double, paused: Bool) -> Double {
         paused ? value : max(0, value - min(1, max(0, elapsed.isFinite ? elapsed : 0)))

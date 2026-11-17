@@ -10,6 +10,7 @@ final class LocationSimulationSession: ObservableObject {
     @Published private(set) var routeCoordinates: [CLLocationCoordinate2D]?
     private var resendTimer: Timer?
     private var routeID: UUID?
+    var currentRouteID: UUID? { routeID }
     let commandGeneration = LocationCommandGeneration()
     @Published private(set) var connectionState: RouteConnectionState = .stopped
     @Published private(set) var lastSuccessfulUpdate: Date?
@@ -26,6 +27,8 @@ final class LocationSimulationSession: ObservableObject {
     @Published private(set) var reconnectRequested = false
     @Published private(set) var stopTitle = ""
     @Published private(set) var stopSecondsRemaining = 0.0
+    @Published private(set) var isReplacingRoute = false
+    private(set) var isHoldingForReplacement = false
     private var playbackTask: Task<Void, Never>?
 
     private init() {}
@@ -45,17 +48,50 @@ final class LocationSimulationSession: ObservableObject {
     }
 
     func startResending(at coordinate: CLLocationCoordinate2D, _ operation: @escaping () -> Int32) {
+        startTimer(at: coordinate, radius: 0) { _ in operation() }
+    }
+
+    func startWandering(at coordinate: CLLocationCoordinate2D, radius: Double,
+                        _ operation: @escaping (CLLocationCoordinate2D) -> Int32) {
+        startTimer(at: coordinate, radius: min(100, max(10, radius)), operation)
+    }
+
+    private func startTimer(at coordinate: CLLocationCoordinate2D, radius: Double,
+                            _ operation: @escaping (CLLocationCoordinate2D) -> Int32) {
         pauseResending()
         start(at: coordinate)
         let generation = commandGeneration
         let token = generation.current()
+        var motion = StaticWanderMotion()
+        var previousTick = ProcessInfo.processInfo.systemUptime
         let timer = Timer(timeInterval: 4, repeats: true) { _ in
+            let now = ProcessInfo.processInfo.systemUptime
+            let elapsed = now - previousTick
+            previousTick = now
+            var next = coordinate
+            if radius > 0 {
+                motion.advance(elapsed: elapsed, radius: radius, angleRoll: Double.random(in: 0...1),
+                    radiusRoll: Double.random(in: 0...1), pauseRoll: Double.random(in: 0...1))
+                // At most one metre of GPS variation; the walk reserves three
+                // metres at the boundary. Use a spherical destination at poles.
+                let jitter = Double.random(in: 0...(2 * Double.pi))
+                let east = motion.east + cos(jitter), north = motion.north + sin(jitter)
+                let angle = hypot(east, north) / 6_371_000
+                let bearing = atan2(east, north)
+                let latitude = coordinate.latitude * .pi / 180
+                let longitude = coordinate.longitude * .pi / 180
+                let lat = asin(sin(latitude) * cos(angle) + cos(latitude) * sin(angle) * cos(bearing))
+                let lon = longitude + atan2(sin(bearing) * sin(angle) * cos(latitude), cos(angle) - sin(latitude) * sin(lat))
+                next = CLLocationCoordinate2D(latitude: lat * 180 / .pi,
+                    longitude: (lon * 180 / .pi + 540).truncatingRemainder(dividingBy: 360) - 180)
+            }
+            let destination = next
             LocationSimulationCommandQueue.shared.async {
                 guard generation.isCurrent(token) else { return }
-                let code = operation()
+                let code = operation(destination)
                 DispatchQueue.main.async {
                     guard generation.isCurrent(token) else { return }
-                    if code == 0 { self.recordSuccessfulUpdate(coordinate) }
+                    if code == 0 { self.recordSuccessfulUpdate(destination) }
                     else { self.recordFailure(locationSimulationErrorMessage(for: code)) }
                 }
             }
@@ -66,12 +102,18 @@ final class LocationSimulationSession: ObservableObject {
 
     func startRoute(at coordinate: CLLocationCoordinate2D, coordinates: [CLLocationCoordinate2D]) -> UUID {
         pauseResending()
+        endRouteReplacement()
+        playbackTask?.cancel()
+        playbackTask = nil
+        updateStop(title: "", remaining: 0)
         let routeID = UUID()
         self.routeID = routeID
         routeCoordinates = coordinates
         isPaused = false
         completedRoundTrips = 0
         returning = false
+        reconnectRequested = false
+        updateProgress(distance: 0, length: 0, speed: 0, eta: 0, returning: false)
         start(at: coordinate)
         return routeID
     }
@@ -80,7 +122,25 @@ final class LocationSimulationSession: ObservableObject {
         self.routeID == routeID
     }
 
+    func beginRouteReplacement(routeID: UUID) -> Bool {
+        guard isCurrentRoute(routeID), !isReplacingRoute,
+              connectionState == .simulating || connectionState == .paused else { return false }
+        isHoldingForReplacement = false
+        isReplacingRoute = true
+        return true
+    }
+
+    func acknowledgeRouteReplacement() {
+        isHoldingForReplacement = isReplacingRoute
+    }
+
+    func endRouteReplacement() {
+        isReplacingRoute = false
+        isHoldingForReplacement = false
+    }
+
     func clearRoute() {
+        endRouteReplacement()
         commandGeneration.invalidate()
         playbackTask?.cancel()
         playbackTask = nil
