@@ -109,6 +109,16 @@ struct RoutePlaybackTimingChecks {
         near(path.length, 200)
         near(path.remainingTime(at: 0, slowdown: 2), 20)
         near(path.remainingTime(at: 150, slowdown: 1), 2.5)
+        let traffic = [RouteTrafficSection(start: 0, end: 100, slowdown: 2),
+            RouteTrafficSection(start: 100, end: 150, slowdown: 4)]
+        near(RouteTrafficSection.slowdown(at: 99, sections: traffic), 2)
+        near(RouteTrafficSection.slowdown(at: 100, sections: traffic), 4)
+        near(RouteTrafficSection.slowdown(at: 150, sections: traffic), 1)
+        near(path.remainingTime(at: 0, sections: traffic), 22.5)
+        near(path.remainingTime(at: 125, sections: traffic), 7.5)
+        near(path.remainingTime(at: 200, sections: traffic), 0)
+        near(RouteTrafficMode.jam.manualSlowdown!, 4)
+        precondition(RouteTrafficMode.automatic.manualSlowdown == nil)
         precondition(path.point(at: 200) == vertices[2])
         near(path.point(at: 50).longitude, 0.0005)
         let reverse = path.reversed()
@@ -168,6 +178,36 @@ struct RoutePlaybackTimingChecks {
         near(RouteStopSchedule.remaining(60, elapsed: 1, paused: true), 60)
         near(RouteStopSchedule.remaining(60, elapsed: 0.5, paused: false), 59.5)
         near(RouteStopSchedule.remaining(0.2, elapsed: 0.5, paused: false), 0)
+        precondition(RouteStopSchedule.validRange(minimum: 0, maximum: 86_400))
+        precondition(!RouteStopSchedule.validRange(minimum: 300, maximum: 120))
+        precondition(!RouteStopSchedule.validRange(minimum: 120, maximum: .infinity))
+        let randomStop = RouteScheduledStop(distance: 50, duration: 120, title: "Random", maximumDuration: 300)
+        near(randomStop.sampled(roll: 0).duration, 120)
+        near(randomStop.sampled(roll: 0.5).duration, 210)
+        near(randomStop.sampled(roll: 1).duration, 300)
+        let reverseRandom = RouteStopSchedule.reversed([randomStop], length: 200)[0]
+        near(reverseRandom.distance, 150)
+        near(reverseRandom.sampled(roll: 1).duration, 300)
+        near(reverseRandom.sampled(roll: 0).duration, 120)
+        let zeroMinimum = RouteScheduledStop(distance: 50, duration: 0, title: "Optional", maximumDuration: 10)
+        precondition(RouteStopSchedule.ordered([zeroMinimum.sampled(roll: 0)], signals: [], length: 200).isEmpty)
+        near(RouteStopSchedule.ordered([zeroMinimum.sampled(roll: 1)], signals: [], length: 200)[0].duration, 10)
+
+        // A long walk stays within the chosen radius and never jumps after
+        // a stalled timer; reserve also leaves space for the GPS variation.
+        for radius in [10.0, 30.0, 100.0] {
+            var wander = StaticWanderMotion()
+            for tick in 0..<1_000 {
+                let east = wander.east, north = wander.north
+                wander.advance(elapsed: 4, radius: radius, angleRoll: Double(tick % 17) / 16,
+                    radiusRoll: Double(tick % 11) / 10, pauseRoll: 0.5)
+                precondition(hypot(wander.east, wander.north) <= radius - 3 + 0.000001)
+                precondition(hypot(wander.east - east, wander.north - north) <= 2.8 + 0.000001)
+            }
+            let east = wander.east, north = wander.north
+            wander.advance(elapsed: 120, radius: radius, angleRoll: 0, radiusRoll: 1, pauseRoll: 0)
+            precondition(hypot(wander.east - east, wander.north - north) <= 2.8 + 0.000001)
+        }
 
 #if ROUTE_SESSION_CHECKS
         let session = LocationSimulationSession.shared
@@ -204,6 +244,33 @@ struct RoutePlaybackTimingChecks {
         precondition(cancellable.isCancelled && !session.isCurrentRoute(routeID))
         routeTask.cancel()
 
+        // Replacement holds do not release background activity or alter the
+        // user's pause state. A committed replacement cancels the old engine
+        // and invalidates pending commands without stopping the connection.
+        let oldRoute = session.startRoute(at: coordinate, coordinates: [coordinate, coordinate])
+        let oldPlayback = Task<Void, Never> { try? await Task.sleep(for: .seconds(30)) }
+        session.attachPlaybackTask(oldPlayback, routeID: oldRoute)
+        session.togglePause()
+        let commandToken = session.commandGeneration.current()
+        precondition(session.beginRouteReplacement(routeID: oldRoute))
+        precondition(!session.beginRouteReplacement(routeID: oldRoute))
+        precondition(!session.isHoldingForReplacement && session.isPaused)
+        session.acknowledgeRouteReplacement()
+        precondition(session.isHoldingForReplacement && session.isActive)
+        session.endRouteReplacement() // A failed calculation keeps the old route.
+        precondition(session.isCurrentRoute(oldRoute) && session.isPaused && !oldPlayback.isCancelled)
+        precondition(session.beginRouteReplacement(routeID: oldRoute))
+        let newRoute = session.startRoute(at: coordinate, coordinates: [coordinate, coordinate])
+        session.togglePause() // The route change preserves the previous user pause.
+        precondition(!session.isCurrentRoute(oldRoute) && session.isCurrentRoute(newRoute))
+        precondition(oldPlayback.isCancelled && !session.commandGeneration.isCurrent(commandToken))
+        precondition(!session.isReplacingRoute && session.isPaused && session.isActive)
+        precondition(BackgroundAudioManager.shared.activities == 1 && BackgroundLocationManager.shared.activities == 1)
+        precondition(session.beginRouteReplacement(routeID: newRoute))
+        session.stop()
+        precondition(!session.isReplacingRoute && !session.isHoldingForReplacement && !session.isActive)
+        precondition(!session.beginRouteReplacement(routeID: newRoute))
+
         // A real resend timer must report errors instead of silently staying active.
         session.startResending(at: coordinate) { 11 }
         RunLoop.main.run(until: Date().addingTimeInterval(4.3))
@@ -220,6 +287,6 @@ struct RoutePlaybackTimingChecks {
         RunLoop.main.run(until: Date().addingTimeInterval(0.1))
         precondition(session.connectionState == .stopped && BackgroundLocationManager.shared.activities == 0)
 #endif
-        print("Streaming geometry, braking, repeated signal visits, session Stop, pause/reconnect and queued cancellation checks passed")
+        print("Streaming geometry, traffic sections, random waits, wander bounds, route replacement, Stop and reconnect checks passed")
     }
 }
